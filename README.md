@@ -59,4 +59,4 @@ make vuln
 - [Releases](docs/RELEASING.md)
 - [Product scope](PRODUCT.md)
 
-No Rowake software license has been selected. Third-party driver notices are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+No Rowake software license has been selected.
