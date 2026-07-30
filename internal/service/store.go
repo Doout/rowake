@@ -53,12 +53,21 @@ func (s *Service) EnablePersistence(ctx context.Context, path string) error {
 		return fmt.Errorf("connection store version %d is not supported", stored.Version)
 	}
 
+	var restoreError error
+	persisted := make([]app.ConnectionRequest, 0, len(stored.Connections))
+	for _, request := range stored.Connections {
+		if !strings.EqualFold(strings.TrimSpace(request.Engine), "sqlite") {
+			restoreError = errors.Join(restoreError,
+				fmt.Errorf("%s: only SQLite connections can be restored; server credentials are session-only", request.Name))
+			continue
+		}
+		persisted = append(persisted, request)
+	}
 	s.mu.Lock()
-	s.saved = append([]app.ConnectionRequest(nil), stored.Connections...)
+	s.saved = append([]app.ConnectionRequest(nil), persisted...)
 	s.mu.Unlock()
 
-	var restoreError error
-	for _, request := range stored.Connections {
+	for _, request := range persisted {
 		if _, err := s.addConnection(ctx, request, false); err != nil {
 			restoreError = errors.Join(restoreError, fmt.Errorf("%s: %w", request.Name, err))
 		}

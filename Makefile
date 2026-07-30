@@ -59,7 +59,7 @@ test-db:
 	$(GO) run ./cmd/rowake-testdb -out testdata/rowake-test.sqlite
 
 integration:
-	$(GO) test ./internal/db -run TestExternalDrivers -count=1 -v
+	$(GO) test ./internal/db ./internal/service -run 'TestExternalDrivers|TestPostgresConnectionWorkflow' -count=1 -v
 
 check:
 	test -z "$$(gofmt -l $$(find . -name '*.go' -type f))"

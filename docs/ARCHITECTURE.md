@@ -4,7 +4,7 @@
 cmd/rowake/          CLI and browser/server launch
 desktop-wails/       Native Wails shell
 internal/app/        Product-facing data contracts
-internal/service/    Session connections and SQLite viewer adapter
+internal/service/    Session connections and database-specific viewer adapters
 internal/db/         database/sql boundary and driver registration
 internal/launch/     Shared loopback server lifecycle
 internal/server/     HTTP API and embedded web serving
@@ -18,11 +18,13 @@ The browser interface uses CodeMirror's SQL package for dialect-aware editing an
 
 ## Service boundary
 
-`internal/app.Service` defines connection creation, catalogs, database topology, table snapshots, and query results. `internal/service` keeps live connections in memory and implements read-only SQLite catalog, foreign-key introspection, table, index, and query operations.
+`internal/app.Service` defines database discovery, connection creation, catalogs, database topology, table snapshots, and query results. `internal/service` keeps live connections in memory and implements read-only SQLite and PostgreSQL catalog, foreign-key introspection, table, index, and query operations.
 
-The Wails shell supplies a user-configuration path to `internal/launch`. Connection definitions are written atomically with user-only file permissions and restored when the desktop app starts. Browser and server launches do not supply a store and remain session-only.
+The Wails shell supplies a user-configuration path to `internal/launch`. SQLite connection definitions are written atomically with user-only file permissions and restored when the desktop app starts. PostgreSQL credentials are never written to that store. Browser and server launches do not supply a store and remain session-only.
 
 SQLite files are opened with `mode=ro`, one pooled connection, bounded row limits, and a query timeout. The statement guard accepts only a single read-oriented statement.
+
+PostgreSQL accepts structured host, port, username, password, database, and SSL-mode settings or a DSN through the API. Before a connection is added, the service can query `pg_database` for databases the account may connect to. Connected pools force `default_transaction_read_only=on`, run user SQL in an explicit read-only transaction, set a statement timeout, hide credentials from connection responses, and expose only non-system schemas.
 
 `GET /api/v1/topology` returns real tables, columns, primary keys, and foreign-key relationships for the selected connection. The browser lays those facts out as an interactive three-column schema map. Search, filters, and sorting in the data browser operate on the bounded table snapshot; they do not issue unbounded queries.
 
@@ -41,8 +43,8 @@ Tests, driver checks, container checks, and release builds enforce this set.
 ## Current limits
 
 - No persistence in browser or server mode.
-- Desktop persistence currently stores SQLite names and local file paths only.
-- No PostgreSQL or MySQL/MariaDB catalog adapters.
+- Desktop persistence stores SQLite names and local file paths only.
+- No MySQL/MariaDB catalog adapter.
 - No row or schema mutation in the current implementation. Table capabilities keep that boundary explicit for planned row editing.
 - No multi-user authentication.
 

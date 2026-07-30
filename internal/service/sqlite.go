@@ -13,10 +13,17 @@ import (
 )
 
 func (s *Service) Catalog(ctx context.Context, connectionID string) (app.Catalog, error) {
-	database, err := s.connection(connectionID)
+	connection, err := s.connection(connectionID)
 	if err != nil {
 		return app.Catalog{}, err
 	}
+	if connection.info.Engine == "postgres" {
+		return postgresCatalog(ctx, connection.database, connectionID)
+	}
+	return sqliteCatalog(ctx, connection.database, connectionID)
+}
+
+func sqliteCatalog(ctx context.Context, database *sql.DB, connectionID string) (app.Catalog, error) {
 	rows, err := database.QueryContext(ctx, `
 		SELECT name, type
 		FROM sqlite_schema
@@ -46,9 +53,12 @@ func (s *Service) Catalog(ctx context.Context, connectionID string) (app.Catalog
 }
 
 func (s *Service) Topology(ctx context.Context, connectionID string) (app.DatabaseTopology, error) {
-	database, err := s.connection(connectionID)
+	connection, err := s.connection(connectionID)
 	if err != nil {
 		return app.DatabaseTopology{}, err
+	}
+	if connection.info.Engine == "postgres" {
+		return postgresTopology(ctx, connection.database, connectionID)
 	}
 	catalog, err := s.Catalog(ctx, connectionID)
 	if err != nil {
@@ -61,7 +71,7 @@ func (s *Service) Topology(ctx context.Context, connectionID string) (app.Databa
 	}
 	for _, schema := range catalog.Schemas {
 		for _, table := range schema.Tables {
-			columns, primaryKey, err := sqliteColumns(ctx, database, table.Name)
+			columns, primaryKey, err := sqliteColumns(ctx, connection.database, table.Name)
 			if err != nil {
 				return app.DatabaseTopology{}, err
 			}
@@ -73,7 +83,7 @@ func (s *Service) Topology(ctx context.Context, connectionID string) (app.Databa
 				Columns:    columns,
 				PrimaryKey: primaryKey,
 			})
-			relationships, err := sqliteRelationships(ctx, database, table.Name)
+			relationships, err := sqliteRelationships(ctx, connection.database, table.Name)
 			if err != nil {
 				return app.DatabaseTopology{}, err
 			}
@@ -84,33 +94,36 @@ func (s *Service) Topology(ctx context.Context, connectionID string) (app.Databa
 }
 
 func (s *Service) Table(ctx context.Context, connectionID, schema, table string, limit int) (app.TableSnapshot, error) {
-	if schema != "main" {
-		return app.TableSnapshot{}, errors.New("SQLite table must use the main schema")
-	}
-	database, err := s.connection(connectionID)
+	connection, err := s.connection(connectionID)
 	if err != nil {
 		return app.TableSnapshot{}, err
 	}
-	if err := verifyTable(ctx, database, table); err != nil {
+	if connection.info.Engine == "postgres" {
+		return postgresTable(ctx, connection.database, connectionID, schema, table, limit)
+	}
+	if schema != "main" {
+		return app.TableSnapshot{}, errors.New("SQLite table must use the main schema")
+	}
+	if err := verifySQLiteTable(ctx, connection.database, table); err != nil {
 		return app.TableSnapshot{}, err
 	}
 	limit = normalizeLimit(limit)
 	started := time.Now()
 
-	columns, primaryKey, err := sqliteColumns(ctx, database, table)
+	columns, primaryKey, err := sqliteColumns(ctx, connection.database, table)
 	if err != nil {
 		return app.TableSnapshot{}, err
 	}
-	indexes, err := sqliteIndexes(ctx, database, table)
+	indexes, err := sqliteIndexes(ctx, connection.database, table)
 	if err != nil {
 		return app.TableSnapshot{}, err
 	}
 
 	var totalRows int64
-	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+qualifiedName(schema, table)).Scan(&totalRows); err != nil {
+	if err := connection.database.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+qualifiedName(schema, table)).Scan(&totalRows); err != nil {
 		return app.TableSnapshot{}, fmt.Errorf("count table rows: %w", err)
 	}
-	rows, err := database.QueryContext(ctx, "SELECT * FROM "+qualifiedName(schema, table)+" LIMIT ?", limit)
+	rows, err := connection.database.QueryContext(ctx, "SELECT * FROM "+qualifiedName(schema, table)+" LIMIT ?", limit)
 	if err != nil {
 		return app.TableSnapshot{}, fmt.Errorf("read table rows: %w", err)
 	}
@@ -140,14 +153,27 @@ func (s *Service) Query(ctx context.Context, request app.QueryRequest) (app.Quer
 	if !db.IsReadOnlyStatement(statement) {
 		return app.QueryResult{}, errors.New("only one read-only SQL statement can be run")
 	}
-	database, err := s.connection(request.ConnectionID)
+	connection, err := s.connection(request.ConnectionID)
 	if err != nil {
 		return app.QueryResult{}, err
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	started := time.Now()
-	rows, err := database.QueryContext(queryCtx, statement)
+
+	queryer := interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	}(connection.database)
+	var transaction *sql.Tx
+	if connection.info.Engine == "postgres" {
+		transaction, err = connection.database.BeginTx(queryCtx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return app.QueryResult{}, fmt.Errorf("start read-only query: %w", err)
+		}
+		defer transaction.Rollback()
+		queryer = transaction
+	}
+	rows, err := queryer.QueryContext(queryCtx, statement)
 	if err != nil {
 		return app.QueryResult{}, fmt.Errorf("run query: %w", err)
 	}
@@ -173,6 +199,11 @@ func (s *Service) Query(ctx context.Context, request app.QueryRequest) (app.Quer
 	if truncated {
 		values = values[:limit]
 	}
+	if transaction != nil {
+		if err := transaction.Commit(); err != nil {
+			return app.QueryResult{}, fmt.Errorf("finish read-only query: %w", err)
+		}
+	}
 	return app.QueryResult{
 		Columns:    columns,
 		Rows:       values,
@@ -183,7 +214,7 @@ func (s *Service) Query(ctx context.Context, request app.QueryRequest) (app.Quer
 	}, nil
 }
 
-func verifyTable(ctx context.Context, database *sql.DB, table string) error {
+func verifySQLiteTable(ctx context.Context, database *sql.DB, table string) error {
 	if strings.TrimSpace(table) == "" {
 		return errors.New("table is required")
 	}

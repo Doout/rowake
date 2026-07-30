@@ -21,6 +21,8 @@ var ErrConnectionRequired = errors.New("no database connection is configured")
 type connectionState struct {
 	info     app.Connection
 	database *sql.DB
+	identity string
+	cleanup  func()
 }
 
 type Service struct {
@@ -53,6 +55,8 @@ func (s *Service) Meta(context.Context) (app.Meta, error) {
 		Version: s.version,
 		Features: map[string]bool{
 			"connection_persistence": persistenceEnabled,
+			"postgres":               true,
+			"postgres_discovery":     true,
 		},
 	}, nil
 }
@@ -72,9 +76,17 @@ func (s *Service) AddConnection(ctx context.Context, request app.ConnectionReque
 }
 
 func (s *Service) addConnection(ctx context.Context, request app.ConnectionRequest, save bool) (app.Connection, error) {
-	if !strings.EqualFold(strings.TrimSpace(request.Engine), "sqlite") {
-		return app.Connection{}, errors.New("only SQLite connections are supported")
+	switch strings.ToLower(strings.TrimSpace(request.Engine)) {
+	case "sqlite":
+		return s.addSQLiteConnection(ctx, request, save)
+	case "postgres", "postgresql":
+		return s.addPostgresConnection(ctx, request)
+	default:
+		return app.Connection{}, errors.New("database engine must be SQLite or PostgreSQL")
 	}
+}
+
+func (s *Service) addSQLiteConnection(ctx context.Context, request app.ConnectionRequest, save bool) (app.Connection, error) {
 	path, err := resolveSQLitePath(request.DataSourceName)
 	if err != nil {
 		return app.Connection{}, err
@@ -82,7 +94,7 @@ func (s *Service) addConnection(ctx context.Context, request app.ConnectionReque
 
 	s.mu.RLock()
 	for _, state := range s.connections {
-		if state.info.Address == path {
+		if state.info.Engine == "sqlite" && state.identity == path {
 			s.mu.RUnlock()
 			return app.Connection{}, errors.New("this SQLite database is already connected")
 		}
@@ -114,7 +126,7 @@ func (s *Service) addConnection(ctx context.Context, request app.ConnectionReque
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, state := range s.connections {
-		if state.info.Address == path {
+		if state.info.Engine == "sqlite" && state.identity == path {
 			_ = database.Close()
 			return app.Connection{}, errors.New("this SQLite database is already connected")
 		}
@@ -141,7 +153,11 @@ func (s *Service) addConnection(ctx context.Context, request app.ConnectionReque
 		}
 		s.saved = saved
 	}
-	s.connections[connection.ID] = &connectionState{info: connection, database: database}
+	s.connections[connection.ID] = &connectionState{
+		info:     connection,
+		database: database,
+		identity: path,
+	}
 	s.order = append(s.order, connection.ID)
 	return connection, nil
 }
@@ -151,7 +167,9 @@ func (s *Service) Close() error {
 	defer s.mu.Unlock()
 	var closeError error
 	for _, state := range s.connections {
-		if err := state.database.Close(); err != nil {
+		if state.cleanup != nil {
+			state.cleanup()
+		} else if err := state.database.Close(); err != nil {
 			closeError = errors.Join(closeError, err)
 		}
 	}
@@ -160,14 +178,14 @@ func (s *Service) Close() error {
 	return closeError
 }
 
-func (s *Service) connection(id string) (*sql.DB, error) {
+func (s *Service) connection(id string) (*connectionState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	state, ok := s.connections[strings.TrimSpace(id)]
 	if !ok {
 		return nil, ErrConnectionRequired
 	}
-	return state.database, nil
+	return state, nil
 }
 
 func resolveSQLitePath(raw string) (string, error) {

@@ -1,3 +1,10 @@
+/*
+THESIS: Opening Rowake begins with a database decision, not a management table or an already-selected session.
+OWN-WORLD: A restrained dark instrument surface, one blue action color, flat connection rows, and precise status signals.
+STORY: Choose a known database, or add one through a focused connection-string/type chooser followed by a dedicated setup screen.
+FIRST VIEWPORT: A quiet Rowake bar, one clear “Choose a database” heading, saved connections as the dominant list, and Add database beside it.
+FORM: Adding a database is a two-step journey; PostgreSQL setup uses General and SSH / SSL tabs, with a live URL composer and an honest tunnel-settings shell.
+*/
 import { basicSetup } from "codemirror";
 import { acceptCompletion, completionStatus, startCompletion } from "@codemirror/autocomplete";
 import { indentWithTab } from "@codemirror/commands";
@@ -53,6 +60,28 @@ import { tags } from "@lezer/highlight";
     queryError: "",
     queryRunning: false,
     connectionFormOpen: false,
+    connectionAddStep: "choose",
+    connectionEngine: "sqlite",
+    connectionEntryURL: "",
+    connectionEntryError: "",
+    connectionEntryTimer: 0,
+    connectionDraft: {
+      name: "",
+      data_source_name: "",
+      connection_url: "",
+      host: "127.0.0.1",
+      port: "5432",
+      username: "",
+      password: "",
+      database: "",
+      ssl_mode: "disable",
+    },
+    postgresDatabases: [],
+    postgresDiscoveryLoading: false,
+    postgresDiscoveryError: "",
+    postgresFormTab: "general",
+    postgresURLTimer: 0,
+    connectingID: "",
     settings: { rowLimit: 100, statementTimeout: 15 },
   };
 
@@ -278,12 +307,32 @@ import { tags } from "@lezer/highlight";
       <main class="main">${content}</main>`;
   }
 
-  function loadingPage(title, active = "browse") {
-    shell(`<section class="page"><header class="page-header"><div><h1 class="page-title">${html(title)}</h1></div></header><div class="loading"><span class="loading-track"><i></i></span>Loading…</div></section>`, active);
+  function launchShell(content) {
+    const connection = currentConnection();
+    const version = state.meta?.version ? `v${state.meta.version.replace(/-.*/, "")}` : "";
+    app.className = "connection-launch";
+    app.innerHTML = `<main class="launch-main">
+      <header class="launch-bar">
+        <div class="launch-brand">
+          <img src="/icon.svg" alt="">
+          <strong>Rowake</strong>
+          <span>Database browser</span>
+        </div>
+        <div class="launch-bar-actions">
+          <span class="launch-readonly"><i></i>Read-only by default</span>
+          ${connection ? `<button type="button" class="btn small" data-nav="browse">Back to ${html(connection.name)}</button>` : ""}
+          <span class="launch-version">${html(version)}</span>
+        </div>
+      </header>
+      ${content}
+    </main>`;
   }
 
   async function bootstrap() {
-    loadingPage("Browse");
+    history.replaceState(null, "", "#/connections");
+    launchShell(`<section class="connection-hub loading-hub">
+      <div class="loading"><span class="loading-track"><i></i></span>Reading available databases…</div>
+    </section>`);
     try {
       const [meta, response] = await Promise.all([
         api("/api/v1/meta"),
@@ -291,13 +340,12 @@ import { tags } from "@lezer/highlight";
       ]);
       state.meta = meta;
       state.connections = response.connections || [];
-      state.connectionID = state.connections[0]?.id || "";
-      if (state.connectionID) await loadCatalog(state.connectionID, true);
+      state.connectionID = "";
       state.loading = false;
       await renderRoute();
     } catch (error) {
       state.loading = false;
-      shell(`<section class="page"><div class="notice error"><strong>Rowake could not start</strong><span>${html(error.message)}</span></div></section>`, "browse");
+      launchShell(`<section class="connection-hub"><div class="notice error"><strong>Rowake could not start</strong><span>${html(error.message)}</span></div></section>`);
     }
   }
 
@@ -480,7 +528,7 @@ import { tags } from "@lezer/highlight";
         <div class="empty-primary">
           <img src="/icon.svg" alt="">
           <h1>No connection</h1>
-          <p>Add a SQLite database to inspect its tables and rows.</p>
+          <p>Add a SQLite or PostgreSQL database to inspect its tables and rows.</p>
           <button type="button" class="btn primary" data-nav="connections">Add database</button>
         </div>
       </section>`, "browse", { workspace: true });
@@ -838,16 +886,19 @@ import { tags } from "@lezer/highlight";
   }
 
   function topologyGroups(topology) {
-    const incoming = new Map(topology.tables.map(table => [table.name, 0]));
-    const outgoing = new Map(topology.tables.map(table => [table.name, 0]));
+    const incoming = new Map(topology.tables.map(table => [topologyTableKey(table), 0]));
+    const outgoing = new Map(topology.tables.map(table => [topologyTableKey(table), 0]));
     topology.relationships.forEach(relationship => {
-      outgoing.set(relationship.from_table, (outgoing.get(relationship.from_table) || 0) + 1);
-      incoming.set(relationship.to_table, (incoming.get(relationship.to_table) || 0) + 1);
+      const from = topologyRelationshipKey(relationship, "from");
+      const to = topologyRelationshipKey(relationship, "to");
+      outgoing.set(from, (outgoing.get(from) || 0) + 1);
+      incoming.set(to, (incoming.get(to) || 0) + 1);
     });
     const groups = { source: [], bridge: [], target: [] };
     topology.tables.forEach(table => {
-      const inCount = incoming.get(table.name) || 0;
-      const outCount = outgoing.get(table.name) || 0;
+      const key = topologyTableKey(table);
+      const inCount = incoming.get(key) || 0;
+      const outCount = outgoing.get(key) || 0;
       if (outCount && !inCount) groups.source.push(table);
       else if (inCount && !outCount) groups.target.push(table);
       else groups.bridge.push(table);
@@ -857,13 +908,14 @@ import { tags } from "@lezer/highlight";
 
   function renderTopologyTable(table, topology, incoming, outgoing) {
     const expanded = state.topologyExpanded.has(table.id);
+    const tableKey = topologyTableKey(table);
     const foreignColumns = new Map(topology.relationships
-      .filter(relationship => relationship.from_table === table.name)
+      .filter(relationship => topologyRelationshipKey(relationship, "from") === tableKey)
       .map(relationship => [relationship.from_column, relationship]));
     const referencedColumns = new Set(topology.relationships
-      .filter(relationship => relationship.to_table === table.name)
+      .filter(relationship => topologyRelationshipKey(relationship, "to") === tableKey)
       .map(relationship => relationship.to_column));
-    return `<article id="topology-${html(table.id)}" class="db-topology-node ${expanded ? "expanded" : ""}" tabindex="0" data-topology-node data-table="${html(table.name)}">
+    return `<article id="topology-${html(table.id)}" class="db-topology-node ${expanded ? "expanded" : ""}" tabindex="0" data-topology-node data-table-key="${html(tableKey)}">
       <header class="db-topology-node-header">
         <span class="topology-table-mark" aria-hidden="true">T</span>
         <div><strong>${html(table.name)}</strong><small>${html(table.schema)} · ${table.columns.length} columns</small></div>
@@ -878,12 +930,20 @@ import { tags } from "@lezer/highlight";
             <span class="column-key ${column.primary_key ? "primary" : foreign ? "foreign" : referenced ? "referenced" : ""}">${column.primary_key ? "PK" : foreign ? "FK" : referenced ? "REF" : ""}</span>
             <span class="topology-column-name">${html(column.name)}</span>
             <span class="topology-column-type">${html(column.data_type || "any")}</span>
-            ${foreign ? `<span class="column-reference" title="References ${html(foreign.to_table)}.${html(foreign.to_column)}">→ ${html(foreign.to_table)}</span>` : ""}
+            ${foreign ? `<span class="column-reference" title="References ${html(foreign.to_schema || "main")}.${html(foreign.to_table)}.${html(foreign.to_column)}">→ ${html(foreign.to_table)}</span>` : ""}
           </div>`;
         }).join("")}
       </div>
-      <footer class="db-topology-node-foot"><span>${outgoing.get(table.name) || 0} outbound</span><span>${incoming.get(table.name) || 0} inbound</span></footer>
+      <footer class="db-topology-node-foot"><span>${outgoing.get(tableKey) || 0} outbound</span><span>${incoming.get(tableKey) || 0} inbound</span></footer>
     </article>`;
+  }
+
+  function topologyTableKey(table) {
+    return `${encodeURIComponent(table.schema || "main")}/${encodeURIComponent(table.name)}`;
+  }
+
+  function topologyRelationshipKey(relationship, side) {
+    return `${encodeURIComponent(relationship[`${side}_schema`] || "main")}/${encodeURIComponent(relationship[`${side}_table`])}`;
   }
 
   function renderTopologyColumn(label, tables, topology, incoming, outgoing) {
@@ -898,7 +958,7 @@ import { tags } from "@lezer/highlight";
   function renderTopology() {
     const connection = currentConnection();
     if (!connection) {
-      shell(`<section class="workspace empty-workspace"><div class="empty-primary"><img src="/icon.svg" alt=""><h1>No connection</h1><p>Add a SQLite database to map its tables and foreign keys.</p><button type="button" class="btn primary" data-nav="connections">Add database</button></div></section>`, "topology", { workspace: true });
+      shell(`<section class="workspace empty-workspace"><div class="empty-primary"><img src="/icon.svg" alt=""><h1>No connection</h1><p>Add a SQLite or PostgreSQL database to map its tables and foreign keys.</p><button type="button" class="btn primary" data-nav="connections">Add database</button></div></section>`, "topology", { workspace: true });
       return;
     }
     if (!state.topology || state.topology.connection_id !== state.connectionID) {
@@ -922,7 +982,7 @@ import { tags } from "@lezer/highlight";
         <div class="header-actions">${connectionPicker()}<button type="button" class="btn" data-action="refresh-topology">↻ <span>Refresh</span></button><button type="button" class="btn primary" data-nav="browse">Browse data</button></div>
       </header>
       <div class="command-strip">
-        <div class="breadcrumb"><span>${html(engineLabel(connection.engine))}</span><i>/</i><strong>main</strong><i>/</i><span>relationships</span></div>
+        <div class="breadcrumb"><span>${html(engineLabel(connection.engine))}</span><i>/</i><strong>${html(connection.database)}</strong><i>/</i><span>${connection.engine === "sqlite" ? "main" : "all schemas"}</span></div>
         <div class="command-signals"><span><i class="signal-dot"></i>Introspected from database</span><span>${topology.relationships.length} foreign keys</span></div>
       </div>
       <div class="topology-toolbar">
@@ -942,14 +1002,14 @@ import { tags } from "@lezer/highlight";
           </div>
         </div>
       </div>
-      <footer class="topology-status"><span>Hover or focus a table to trace its relationships.</span><span>SQLite · read-only</span></footer>
+      <footer class="topology-status"><span>Hover or focus a table to trace its relationships.</span><span>${html(engineLabel(connection.engine))} · read-only</span></footer>
     </section>`;
     shell(body, "topology", { workspace: true });
     requestAnimationFrame(bindDatabaseTopology);
   }
 
-  function topologyNodeByName(name) {
-    return [...document.querySelectorAll("[data-topology-node]")].find(node => node.dataset.table === name);
+  function topologyNodeByKey(key) {
+    return [...document.querySelectorAll("[data-topology-node]")].find(node => node.dataset.tableKey === key);
   }
 
   function topologyFieldByName(node, column) {
@@ -970,8 +1030,10 @@ import { tags } from "@lezer/highlight";
     const width = map.offsetWidth;
     const height = map.offsetHeight;
     const paths = state.topology.relationships.map(relationship => {
-      const from = topologyNodeByName(relationship.from_table);
-      const to = topologyNodeByName(relationship.to_table);
+      const fromKey = topologyRelationshipKey(relationship, "from");
+      const toKey = topologyRelationshipKey(relationship, "to");
+      const from = topologyNodeByKey(fromKey);
+      const to = topologyNodeByKey(toKey);
       if (!from || !to) return "";
       const fromField = topologyFieldByName(from, relationship.from_column);
       const toField = topologyFieldByName(to, relationship.to_column);
@@ -987,21 +1049,21 @@ import { tags } from "@lezer/highlight";
       const distance = Math.max(54, Math.abs(endX - startX) * .48);
       const controlOne = forward ? startX + distance : startX - distance;
       const controlTwo = forward ? endX - distance : endX + distance;
-      return `<path class="topology-edge" data-from="${html(relationship.from_table)}" data-to="${html(relationship.to_table)}" d="M ${startX} ${startY} C ${controlOne} ${startY}, ${controlTwo} ${endY}, ${endX} ${endY}" marker-start="url(#topology-origin)" marker-end="url(#topology-arrow)"><title>${html(relationship.from_table)}.${html(relationship.from_column)} → ${html(relationship.to_table)}.${html(relationship.to_column)}</title></path>`;
+      return `<path class="topology-edge" data-from="${html(fromKey)}" data-to="${html(toKey)}" d="M ${startX} ${startY} C ${controlOne} ${startY}, ${controlTwo} ${endY}, ${endX} ${endY}" marker-start="url(#topology-origin)" marker-end="url(#topology-arrow)"><title>${html(relationship.from_schema || "main")}.${html(relationship.from_table)}.${html(relationship.from_column)} → ${html(relationship.to_schema || "main")}.${html(relationship.to_table)}.${html(relationship.to_column)}</title></path>`;
     }).join("");
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.innerHTML = `<defs><marker id="topology-origin" viewBox="0 0 7 7" refX="3.5" refY="3.5" markerWidth="6" markerHeight="6"><circle cx="3.5" cy="3.5" r="2.2"></circle></marker><marker id="topology-arrow" viewBox="0 0 7 7" refX="6" refY="3.5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 7 3.5 0 7z"></path></marker></defs>${paths}`;
   }
 
-  function highlightTopologyTable(name) {
+  function highlightTopologyTable(key) {
     document.querySelectorAll("[data-topology-node]").forEach(node => {
-      node.classList.toggle("connected", node.dataset.table !== name && state.topology.relationships.some(relationship =>
-        (relationship.from_table === name && relationship.to_table === node.dataset.table) ||
-        (relationship.to_table === name && relationship.from_table === node.dataset.table)
+      node.classList.toggle("connected", node.dataset.tableKey !== key && state.topology.relationships.some(relationship =>
+        (topologyRelationshipKey(relationship, "from") === key && topologyRelationshipKey(relationship, "to") === node.dataset.tableKey) ||
+        (topologyRelationshipKey(relationship, "to") === key && topologyRelationshipKey(relationship, "from") === node.dataset.tableKey)
       ));
-      node.classList.toggle("focused", node.dataset.table === name);
+      node.classList.toggle("focused", node.dataset.tableKey === key);
     });
-    document.querySelectorAll(".topology-edge").forEach(edge => edge.classList.toggle("active", edge.dataset.from === name || edge.dataset.to === name));
+    document.querySelectorAll(".topology-edge").forEach(edge => edge.classList.toggle("active", edge.dataset.from === key || edge.dataset.to === key));
   }
 
   function clearTopologyHighlight() {
@@ -1027,9 +1089,9 @@ import { tags } from "@lezer/highlight";
     state.topologyObserver.observe(viewport);
     state.topologyObserver.observe(map);
     document.querySelectorAll("[data-topology-node]").forEach(node => {
-      node.addEventListener("pointerenter", () => highlightTopologyTable(node.dataset.table));
+      node.addEventListener("pointerenter", () => highlightTopologyTable(node.dataset.tableKey));
       node.addEventListener("pointerleave", clearTopologyHighlight);
-      node.addEventListener("focusin", () => highlightTopologyTable(node.dataset.table));
+      node.addEventListener("focusin", () => highlightTopologyTable(node.dataset.tableKey));
       node.addEventListener("focusout", clearTopologyHighlight);
     });
     drawDatabaseTopology();
@@ -1282,7 +1344,7 @@ import { tags } from "@lezer/highlight";
         <div class="empty-primary">
           <span class="empty-glyph">⌁</span>
           <h1>No connection</h1>
-          <p>Add a SQLite database before running SQL.</p>
+          <p>Add a SQLite or PostgreSQL database before running SQL.</p>
           <button type="button" class="btn primary" data-nav="connections">Add database</button>
         </div>
       </section>`, "query", { workspace: true });
@@ -1327,55 +1389,537 @@ import { tags } from "@lezer/highlight";
   function renderConnections() {
     const hasConnections = state.connections.length > 0;
     const showForm = !hasConnections || state.connectionFormOpen;
-    const body = `<section class="page connections-page">
-      <header class="page-header">
-        <div><h1 class="page-title">Connections</h1></div>
-        <div class="header-actions">
-          ${hasConnections && !showForm ? `<button type="button" class="btn primary" data-action="show-connection-form">Add database</button>` : ""}
-        </div>
-      </header>
-      ${showForm ? renderConnectionForm(hasConnections) : ""}
-      ${hasConnections ? `<div class="table-wrap"><table class="data-table connection-table"><thead><tr><th>Connection</th><th>Engine</th><th>Database file</th><th>Access</th><th></th></tr></thead><tbody>
-        ${state.connections.map(connection => `<tr class="connection-row ${connection.id === state.connectionID ? "current" : ""}">
-          <td><div class="connection-name"><span class="engine-tile ${html(connection.engine)}">${engineMonogram(connection.engine)}</span><div><strong>${html(connection.name)}</strong>${connection.name !== connection.database ? `<small>${html(connection.database)}</small>` : ""}</div></div></td>
-          <td><span class="engine-label">${html(engineLabel(connection.engine))}</span></td>
-          <td><code class="endpoint-code">${html(connection.address)}</code></td>
-          <td><span class="status ${connection.status === "connected" ? "good" : "neutral"}">${html(connection.status)}</span><small class="block-subtle">${connection.read_only ? "Read-only" : "Read/write"}</small></td>
-          <td class="row-actions"><button class="btn small ${connection.id === state.connectionID ? "selected-action" : ""}" type="button" data-action="use-connection" data-connection="${html(connection.id)}">${connection.id === state.connectionID ? "Active" : "Open"}</button></td>
-        </tr>`).join("")}
-      </tbody></table></div>` : ""}
+    const configuring = showForm && state.connectionAddStep === "configure";
+    const heading = !showForm
+      ? "Choose a database"
+      : configuring
+        ? state.connectionEngine === "postgres" ? "Connect to PostgreSQL" : "Open a SQLite database"
+        : hasConnections ? "Add another database" : "Add your first database";
+    const description = !showForm
+      ? "Select a database to enter the workspace. You can return here whenever you need to switch."
+      : configuring
+        ? state.connectionEngine === "postgres"
+          ? "Paste a PostgreSQL URL or enter the connection details. Rowake opens the database in read-only mode."
+          : "Choose a local database file. Rowake opens it in read-only mode."
+        : "Paste a connection string to detect its type, or choose a database below.";
+    const body = `<section class="connection-hub">
+      <div class="connection-hub-content">
+        <header class="connection-hub-header">
+          <div>
+            <span class="connection-hub-kicker">${showForm ? "New connection" : "Start here"}</span>
+            <h1>${html(heading)}</h1>
+            <p>${html(description)}</p>
+          </div>
+          ${hasConnections && !showForm ? `<button type="button" class="btn primary" data-action="show-connection-form"><span aria-hidden="true">＋</span>Add database</button>` : ""}
+        </header>
+        ${showForm
+          ? state.connectionAddStep === "configure"
+            ? renderConnectionForm()
+            : renderConnectionEntry(hasConnections)
+          : renderConnectionChoices()}
+      </div>
+      <footer class="connection-hub-footer">
+        <span>Database credentials define the access boundary.</span>
+        <span>Connection previews and query results remain bounded.</span>
+      </footer>
     </section>`;
-    shell(body, "connections");
+    launchShell(body);
   }
 
-  function renderConnectionForm(canCancel) {
-    return `<section class="connection-editor" aria-labelledby="connection-editor-title">
-      <header class="connection-editor-header">
-        <span class="engine-tile sqlite" aria-hidden="true">S</span>
-        <div>
-          <h2 id="connection-editor-title">Add SQLite database</h2>
-          <p>Open an existing database file in read-only mode.</p>
-        </div>
+  function renderConnectionChoices() {
+    return `<section class="connection-list" aria-label="Available databases">
+      <header class="connection-list-header">
+        <span>Available databases</span>
+        <small>${state.connections.length} ${state.connections.length === 1 ? "connection" : "connections"}</small>
       </header>
-      <form id="connection-form">
-        <label class="connection-field">
-          <span>Name <small>optional</small></span>
-          <input name="name" type="text" autocomplete="off" placeholder="Local database">
-        </label>
-        <label class="connection-field path-field">
-          <span>Database file</span>
-          <input name="data_source_name" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/database.sqlite" required>
-        </label>
+      <div class="connection-list-body">
+        ${state.connections.map(connection => {
+          const active = connection.id === state.connectionID;
+          const connecting = connection.id === state.connectingID;
+          return `<article class="connection-choice ${active ? "active" : ""}">
+            <div class="connection-choice-identity">
+              <span class="engine-tile ${html(connection.engine)}">${engineMonogram(connection.engine)}</span>
+              <div>
+                <strong>${html(connection.name)}</strong>
+                <span>${html(connection.database)}</span>
+              </div>
+            </div>
+            <div class="connection-choice-facts">
+              <span>${html(engineLabel(connection.engine))}</span>
+              <code title="${html(connection.address)}">${html(connection.address)}</code>
+            </div>
+            <div class="connection-choice-access">
+              <span class="ready-signal"><i></i>${active ? "In use" : "Ready"}</span>
+              <small>${connection.read_only ? "Read-only" : "Read/write"}</small>
+            </div>
+            <button class="btn ${active ? "" : "primary"}" type="button" data-action="use-connection" data-connection="${html(connection.id)}" ${connecting ? "disabled" : ""}>
+              ${connecting ? "Connecting…" : active ? "Continue" : "Connect"}
+            </button>
+          </article>`;
+        }).join("")}
+      </div>
+      <button type="button" class="add-connection-row" data-action="show-connection-form">
+        <span aria-hidden="true">＋</span>
+        <span><strong>Add another database</strong><small>SQLite file or PostgreSQL server</small></span>
+        <i aria-hidden="true">→</i>
+      </button>
+    </section>`;
+  }
+
+  function renderConnectionEntry(canCancel) {
+    return `<section class="connection-editor connection-entry" aria-label="Choose a database type">
+      <form id="connection-entry-form">
+        <div class="connection-entry-url">
+          <label for="connection-string-entry">Connection string</label>
+          <div class="connection-string-control">
+            <span aria-hidden="true">⌁</span>
+            <input id="connection-string-entry" name="connection_string" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="protocol://user:password@host:port/database" value="${html(state.connectionEntryURL)}" aria-describedby="connection-entry-status">
+          </div>
+          <small id="connection-entry-status" class="field-status ${state.connectionEntryError ? "error-copy" : ""}" aria-live="polite">${html(state.connectionEntryError || "Paste your connection string to auto-detect the database type.")}</small>
+        </div>
+        <div class="connection-choice-divider"><span>or select database</span></div>
+        <div class="database-type-picker" role="group" aria-label="Database type">
+          <button type="button" data-action="choose-connection-engine" data-engine="postgres">
+            <span class="engine-tile postgres" aria-hidden="true">P</span>
+            <span><strong>PostgreSQL</strong><small>Connect to a database server</small></span>
+            <i aria-hidden="true">→</i>
+          </button>
+          <button type="button" data-action="choose-connection-engine" data-engine="sqlite">
+            <span class="engine-tile sqlite" aria-hidden="true">S</span>
+            <span><strong>SQLite</strong><small>Open a local database file</small></span>
+            <i aria-hidden="true">→</i>
+          </button>
+        </div>
+        <button class="sr-only" type="submit">Continue</button>
+        ${canCancel ? `<footer class="connection-entry-actions"><button type="button" class="btn" data-action="cancel-connection-form">Back to databases</button></footer>` : ""}
+      </form>
+    </section>`;
+  }
+
+  function renderConnectionForm() {
+    const postgres = state.connectionEngine === "postgres";
+    const draft = state.connectionDraft;
+    const persistenceCopy = postgres
+      ? "Credentials stay in memory until Rowake closes."
+      : state.meta?.features?.connection_persistence
+        ? "Saved on this device."
+        : "Available until Rowake closes.";
+    return `<section class="connection-editor" aria-label="Connection details">
+      <form id="connection-form" class="${postgres ? "postgres-form" : "sqlite-form"}">
+        <div class="connection-setup-heading">
+          <button type="button" class="connection-back-link" data-action="back-to-connection-types"><span aria-hidden="true">←</span> Database types</button>
+          <div class="connection-setup-identity">
+            <span class="engine-tile ${postgres ? "postgres" : "sqlite"}" aria-hidden="true">${postgres ? "P" : "S"}</span>
+            <span><strong>${postgres ? "PostgreSQL" : "SQLite"}</strong><small>${postgres ? "Server connection" : "Local database file"}</small></span>
+          </div>
+        </div>
+        ${postgres ? `
+          <label class="connection-field connection-name-field connection-name-wide">
+            <span>Connection name <small>optional</small></span>
+            <input id="connection-name" name="name" type="text" autocomplete="off" maxlength="120" placeholder="My PostgreSQL database" value="${html(draft.name)}">
+          </label>
+          ${renderPostgresConnectionFields(draft)}` : `
+          <label class="connection-field connection-name-field">
+            <span>Connection name <small>optional</small></span>
+            <input id="connection-name" name="name" type="text" autocomplete="off" maxlength="120" placeholder="Local database" value="${html(draft.name)}">
+          </label>
+          <label class="connection-field path-field">
+            <span>Database file</span>
+            <input name="data_source_name" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/database.sqlite" value="${html(draft.data_source_name)}" required>
+          </label>`}
         <p class="connection-form-error" role="alert" hidden></p>
         <footer class="connection-form-actions">
-          <span>${state.meta?.features?.connection_persistence ? "Saved on this device." : "Available until Rowake closes."}</span>
+          <span>${persistenceCopy}</span>
           <div>
-            ${canCancel ? `<button type="button" class="btn" data-action="cancel-connection-form">Cancel</button>` : ""}
-            <button type="submit" class="btn primary">Add connection</button>
+            <button type="button" class="btn" data-action="back-to-connection-types">Back</button>
+            <button type="submit" class="btn primary">Add and connect</button>
           </div>
         </footer>
       </form>
     </section>`;
+  }
+
+  function renderPostgresConnectionFields(draft) {
+    const securityTab = state.postgresFormTab === "security";
+    const databases = state.postgresDatabases;
+    const connectionURL = draft.connection_url || postgresURLFromDraft(draft);
+    const databaseControl = databases.length
+      ? `<select id="postgres-database" name="database" required aria-describedby="postgres-database-status">
+          <option value="">Select a database</option>
+          ${databases.map(database => `<option value="${html(database)}" ${database === draft.database ? "selected" : ""}>${html(database)}</option>`).join("")}
+        </select>`
+      : `<input id="postgres-database" name="database" type="text" autocomplete="off" spellcheck="false" maxlength="63" placeholder="postgres" value="${html(draft.database)}" required aria-describedby="postgres-database-status">`;
+    let status = "Enter a database name, or load the databases this account can connect to.";
+    let statusClass = "";
+    if (state.postgresDiscoveryLoading) {
+      status = "Connecting to PostgreSQL and reading available databases…";
+      statusClass = "loading-copy";
+    } else if (state.postgresDiscoveryError) {
+      status = state.postgresDiscoveryError;
+      statusClass = "error-copy";
+    } else if (databases.length) {
+      status = `${databases.length} ${databases.length === 1 ? "database" : "databases"} available to this account.`;
+      statusClass = "success-copy";
+    }
+    return `<nav class="connection-setup-tabs" role="tablist" aria-label="PostgreSQL connection settings">
+      <button id="postgres-general-tab" type="button" role="tab" class="${securityTab ? "" : "active"}" data-action="select-postgres-form-tab" data-postgres-tab="general" aria-selected="${!securityTab}" aria-controls="postgres-general-panel" tabindex="${securityTab ? "-1" : "0"}">General</button>
+      <button id="postgres-security-tab" type="button" role="tab" class="${securityTab ? "active" : ""}" data-action="select-postgres-form-tab" data-postgres-tab="security" aria-selected="${securityTab}" aria-controls="postgres-security-panel" tabindex="${securityTab ? "0" : "-1"}">
+        <span>SSH / SSL</span><small>SSH</small>
+      </button>
+    </nav>
+    ${securityTab ? renderPostgresSecurityFields(draft) : `<section id="postgres-general-panel" class="postgres-tab-panel postgres-general-panel" role="tabpanel" aria-labelledby="postgres-general-tab">
+      <div class="connection-field postgres-url-field">
+        <label for="postgres-url">Connection URI</label>
+        <div class="postgres-url-control">
+          <span aria-hidden="true">P</span>
+          <input id="postgres-url" name="connection_url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="postgresql://user:password@localhost:5432/database" value="${html(connectionURL)}" aria-describedby="postgres-url-status postgres-url-security">
+        </div>
+        <small id="postgres-url-status" class="field-status" aria-live="polite">Paste a PostgreSQL URL, or edit the fields below to build it.</small>
+        <small id="postgres-url-security" class="postgres-url-security">This URL may reveal your password. It stays in memory and is not saved.</small>
+      </div>
+      <div class="connection-method-divider"><span>or</span></div>
+      <p class="connection-parts-note">Enter the connection details separately. Every change updates the URI above.</p>
+      <label class="connection-field host-field">
+        <span>Host</span>
+        <input name="host" type="text" autocomplete="off" spellcheck="false" placeholder="127.0.0.1" value="${html(draft.host)}" required>
+      </label>
+      <label class="connection-field port-field">
+        <span>Port</span>
+        <input name="port" type="number" inputmode="numeric" min="1" max="65535" value="${html(draft.port)}" required>
+      </label>
+      <label class="connection-field username-field">
+        <span>Username</span>
+        <input name="username" type="text" autocomplete="username" spellcheck="false" value="${html(draft.username)}" required>
+      </label>
+      <label class="connection-field password-field">
+        <span>Password <small>optional</small></span>
+        <input name="password" type="password" autocomplete="current-password" value="${html(draft.password)}">
+      </label>
+      <div class="connection-field database-field">
+        <label for="postgres-database">Database</label>
+        <div class="database-picker">
+          ${databaseControl}
+          <button type="button" class="btn" data-action="discover-postgres-databases" ${state.postgresDiscoveryLoading ? "disabled" : ""}>${state.postgresDiscoveryLoading ? "Loading…" : databases.length ? "Reload list" : "Load databases"}</button>
+        </div>
+        <small id="postgres-database-status" class="field-status ${statusClass}" aria-live="polite">${html(status)}</small>
+      </div>
+    </section>`}`;
+  }
+
+  function renderPostgresSecurityFields(draft) {
+    const sslModeLabels = {
+      disable: "Disabled",
+      prefer: "Prefer",
+      require: "Require",
+      "verify-ca": "Verify CA",
+      "verify-full": "Verify full",
+    };
+    return `<section id="postgres-security-panel" class="postgres-tab-panel postgres-security-panel" role="tabpanel" aria-labelledby="postgres-security-tab">
+      <label class="connection-field security-ssl-field">
+        <span>SSL mode</span>
+        <select name="ssl_mode" aria-describedby="ssl-mode-status">
+          ${Object.entries(sslModeLabels).map(([mode, label]) => `<option value="${mode}" ${mode === draft.ssl_mode ? "selected" : ""}>${label}</option>`).join("")}
+        </select>
+        <small id="ssl-mode-status" class="field-status">TLS mode is included in the connection URL when enabled.</small>
+      </label>
+      <div class="ssh-tunnel-heading">
+        <span>SSH tunnel</span>
+        <small>Jump Server</small>
+      </div>
+      <div class="ssh-tunnel-mode" aria-label="SSH tunnel mode">
+        <span class="active">Off</span>
+        <span aria-disabled="true">Over SSH <i>Coming later</i></span>
+      </div>
+      <fieldset class="ssh-fields-shell" disabled aria-describedby="ssh-shell-status">
+        <legend class="sr-only">Future SSH tunnel settings</legend>
+        <label class="connection-field ssh-server-field">
+          <span>SSH server</span>
+          <input type="text" placeholder="192.168.1.1">
+        </label>
+        <label class="connection-field ssh-port-field">
+          <span>Port</span>
+          <input type="number" inputmode="numeric" value="22">
+        </label>
+        <label class="connection-field ssh-username-field">
+          <span>SSH username</span>
+          <input type="text" placeholder="ubuntu">
+        </label>
+        <div class="ssh-authentication-shell">
+          <span>Authentication</span>
+          <div><strong>Password</strong><span>Private key</span></div>
+        </div>
+        <label class="connection-field ssh-password-field">
+          <span>SSH password</span>
+          <input type="password" placeholder="••••••••">
+        </label>
+      </fieldset>
+      <p id="ssh-shell-status" class="ssh-shell-status">SSH tunneling is not active yet. This area reserves the future Jump Server settings.</p>
+    </section>`;
+  }
+
+  function freshConnectionDraft() {
+    return {
+      name: "",
+      data_source_name: "",
+      connection_url: "",
+      host: "127.0.0.1",
+      port: "5432",
+      username: "",
+      password: "",
+      database: "",
+      ssl_mode: "disable",
+    };
+  }
+
+  function resetConnectionAddFlow() {
+    clearTimeout(state.connectionEntryTimer);
+    clearTimeout(state.postgresURLTimer);
+    state.connectionAddStep = "choose";
+    state.connectionEngine = "sqlite";
+    state.connectionEntryURL = "";
+    state.connectionEntryError = "";
+    state.connectionDraft = freshConnectionDraft();
+    state.postgresDatabases = [];
+    state.postgresDiscoveryLoading = false;
+    state.postgresDiscoveryError = "";
+    state.postgresFormTab = "general";
+  }
+
+  function decodePostgresURLPart(value) {
+    try {
+      return decodeURIComponent(value || "");
+    } catch {
+      throw new Error("The connection URL contains invalid percent-encoding");
+    }
+  }
+
+  function parsePostgresURL(value) {
+    const raw = String(value || "").trim();
+    if (!raw) throw new Error("Enter a PostgreSQL connection URL");
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      throw new Error("Enter a complete PostgreSQL URL");
+    }
+    if (!["postgres:", "postgresql:"].includes(url.protocol)) {
+      throw new Error("The URL must start with postgres:// or postgresql://");
+    }
+    if (!url.hostname) throw new Error("The PostgreSQL URL needs a host");
+    const sslMode = url.searchParams.get("sslmode") || url.searchParams.get("ssl_mode") || "disable";
+    if (!["disable", "prefer", "require", "verify-ca", "verify-full"].includes(sslMode)) {
+      throw new Error(`Unsupported sslmode "${sslMode}"`);
+    }
+    return {
+      host: url.hostname.replace(/^\[(.*)\]$/, "$1"),
+      port: url.port || "5432",
+      username: decodePostgresURLPart(url.username),
+      password: decodePostgresURLPart(url.password),
+      database: decodePostgresURLPart(url.pathname.replace(/^\/+/, "")),
+      ssl_mode: sslMode,
+    };
+  }
+
+  function postgresURLFromDraft(draft) {
+    const hostValue = String(draft.host || "127.0.0.1").trim();
+    const host = hostValue.includes(":") && !hostValue.startsWith("[") ? `[${hostValue}]` : hostValue;
+    const username = String(draft.username || "");
+    const password = String(draft.password || "");
+    const credentials = username
+      ? `${encodeURIComponent(username)}${password ? `:${encodeURIComponent(password)}` : ""}@`
+      : "";
+    const port = String(draft.port || "5432").trim();
+    const database = String(draft.database || "").trim();
+    const sslMode = String(draft.ssl_mode || "disable");
+    const query = sslMode && sslMode !== "disable" ? `?sslmode=${encodeURIComponent(sslMode)}` : "";
+    return `postgresql://${credentials}${host}${port ? `:${port}` : ""}/${database ? encodeURIComponent(database) : ""}${query}`;
+  }
+
+  function normalizedPostgresDraft(draft) {
+    if (!String(draft.connection_url || "").trim()) {
+      return { ...draft, connection_url: postgresURLFromDraft(draft) };
+    }
+    const parsed = parsePostgresURL(draft.connection_url);
+    const normalized = { ...draft, ...parsed };
+    return { ...normalized, connection_url: postgresURLFromDraft(normalized) };
+  }
+
+  function setConnectionEntryStatus(message, kind = "") {
+    const status = document.getElementById("connection-entry-status");
+    if (!status) return;
+    status.textContent = message;
+    status.className = `field-status ${kind}`.trim();
+  }
+
+  function applyConnectionEntryURL(value, reportIncomplete = false, announce = true) {
+    state.connectionEntryURL = String(value || "");
+    const raw = state.connectionEntryURL.trim();
+    if (!raw) {
+      state.connectionEntryError = "";
+      if (announce) setConnectionEntryStatus("Paste your connection string to auto-detect the database type.");
+      return false;
+    }
+    try {
+      const parsed = parsePostgresURL(raw);
+      const draft = { ...freshConnectionDraft(), ...parsed };
+      draft.connection_url = postgresURLFromDraft(draft);
+      state.connectionDraft = draft;
+      state.connectionEntryURL = draft.connection_url;
+      state.connectionEntryError = "";
+      state.connectionEngine = "postgres";
+      state.connectionAddStep = "configure";
+      state.postgresFormTab = "general";
+      renderConnections();
+      document.getElementById("connection-name")?.focus();
+      return true;
+    } catch (error) {
+      const looksComplete = /^[a-z][a-z0-9+.-]*:\/\/[^/\s]+/i.test(raw);
+      const showError = reportIncomplete || looksComplete;
+      state.connectionEntryError = showError ? error.message : "";
+      if (announce) {
+        setConnectionEntryStatus(
+          showError ? error.message : "Waiting for a complete connection string…",
+          showError ? "error-copy" : ""
+        );
+      }
+      return false;
+    }
+  }
+
+  function setPostgresURLStatus(message, kind = "") {
+    const status = document.getElementById("postgres-url-status");
+    if (!status) return;
+    status.textContent = message;
+    status.className = `field-status ${kind}`.trim();
+  }
+
+  function applyPostgresURLToForm(value, reportIncomplete = false, announce = true) {
+    const form = document.getElementById("connection-form");
+    if (!form) return false;
+    if (!String(value || "").trim()) {
+      if (announce) setPostgresURLStatus("Paste a PostgreSQL URL, or edit the fields below to build it.");
+      return false;
+    }
+    try {
+      const parsed = parsePostgresURL(value);
+      const draft = { ...connectionDraftFromForm(form), ...parsed };
+      draft.connection_url = postgresURLFromDraft(draft);
+      state.connectionDraft = draft;
+      ["host", "port", "username", "password", "ssl_mode"].forEach(name => {
+        if (form.elements[name]) form.elements[name].value = draft[name];
+      });
+      const databaseControl = form.elements.database;
+      if (databaseControl) {
+        if (databaseControl.tagName === "SELECT" && draft.database && ![...databaseControl.options].some(option => option.value === draft.database)) {
+          databaseControl.add(new Option(draft.database, draft.database), 1);
+        }
+        databaseControl.value = draft.database;
+      }
+      const urlInput = document.getElementById("postgres-url");
+      if (urlInput) urlInput.value = draft.connection_url;
+      const errorNode = form.querySelector(".connection-form-error");
+      if (errorNode) errorNode.hidden = true;
+      state.postgresDiscoveryError = "";
+      if (announce) setPostgresURLStatus("URL applied to the connection fields.", "success-copy");
+      return true;
+    } catch (error) {
+      const looksComplete = /^[a-z][a-z0-9+.-]*:\/\/[^/\s]+/i.test(String(value || "").trim());
+      const showError = reportIncomplete || looksComplete;
+      if (announce) {
+        setPostgresURLStatus(
+          showError ? error.message : "Waiting for a complete PostgreSQL URL…",
+          showError ? "error-copy" : ""
+        );
+      }
+      return false;
+    }
+  }
+
+  function syncPostgresURLFromForm(announce = true) {
+    const form = document.getElementById("connection-form");
+    const urlInput = document.getElementById("postgres-url");
+    if (!form) return;
+    const draft = connectionDraftFromForm(form);
+    draft.connection_url = postgresURLFromDraft(draft);
+    state.connectionDraft = draft;
+    if (urlInput) {
+      urlInput.value = draft.connection_url;
+      if (announce) setPostgresURLStatus("URL updated from the connection fields.", "success-copy");
+    }
+  }
+
+  function connectionDraftFromForm(form = document.getElementById("connection-form")) {
+    if (!form) return { ...state.connectionDraft };
+    const fields = new FormData(form);
+    const value = (name, fallback = "") => fields.has(name) ? String(fields.get(name) || "") : fallback;
+    return {
+      name: value("name", state.connectionDraft.name).trim(),
+      data_source_name: value("data_source_name", state.connectionDraft.data_source_name).trim(),
+      connection_url: value("connection_url", state.connectionDraft.connection_url).trim(),
+      host: value("host", state.connectionDraft.host || "127.0.0.1").trim(),
+      port: value("port", state.connectionDraft.port || "5432").trim(),
+      username: value("username", state.connectionDraft.username).trim(),
+      password: value("password", state.connectionDraft.password),
+      database: value("database", state.connectionDraft.database).trim(),
+      ssl_mode: value("ssl_mode", state.connectionDraft.ssl_mode || "disable"),
+    };
+  }
+
+  function postgresRequest(draft) {
+    return {
+      name: draft.name,
+      engine: "postgres",
+      host: draft.host,
+      port: Number(draft.port),
+      username: draft.username,
+      password: draft.password,
+      database: draft.database,
+      ssl_mode: draft.ssl_mode,
+    };
+  }
+
+  async function discoverPostgresDatabases() {
+    const form = document.getElementById("connection-form");
+    const errorNode = form?.querySelector(".connection-form-error");
+    try {
+      state.connectionDraft = normalizedPostgresDraft(connectionDraftFromForm(form));
+    } catch (error) {
+      if (errorNode) {
+        errorNode.textContent = `${error.message}. Correct the connection URL or edit the fields below.`;
+        errorNode.hidden = false;
+      }
+      setPostgresURLStatus(error.message, "error-copy");
+      return;
+    }
+    if (!state.connectionDraft.host || !state.connectionDraft.username) {
+      if (errorNode) {
+        errorNode.textContent = "Enter the PostgreSQL host and username before loading databases.";
+        errorNode.hidden = false;
+      }
+      return;
+    }
+    state.postgresDiscoveryLoading = true;
+    state.postgresDiscoveryError = "";
+    renderConnections();
+    try {
+      const response = await api("/api/v1/databases", {
+        method: "POST",
+        body: JSON.stringify(postgresRequest(state.connectionDraft)),
+      });
+      state.postgresDatabases = response.databases || [];
+      if (!state.postgresDatabases.length) {
+        state.postgresDiscoveryError = "No connectable databases were returned. Enter a database name manually.";
+      } else if (!state.postgresDatabases.includes(state.connectionDraft.database)) {
+        state.connectionDraft.database = "";
+      }
+    } catch (error) {
+      state.postgresDatabases = [];
+      state.postgresDiscoveryError = `${error.message}. Check the host, credentials, and SSL mode, then try again.`;
+    } finally {
+      state.postgresDiscoveryLoading = false;
+      renderConnections();
+      document.querySelector('[name="database"]')?.focus();
+    }
   }
 
   function engineMonogram(engine) {
@@ -1387,6 +1931,10 @@ import { tags } from "@lezer/highlight";
       if (destination === "connections") navigate("browse");
       return;
     }
+    const previousConnectionID = state.connectionID;
+    const previousCatalog = state.catalog;
+    state.connectingID = connectionID;
+    if (destination === "connections") renderConnections();
     state.snapshot = null;
     state.topology = null;
     state.topologyError = "";
@@ -1399,7 +1947,13 @@ import { tags } from "@lezer/highlight";
       if (destination === "connections") navigate("browse");
       else renderRoute();
     } catch (error) {
+      state.connectionID = previousConnectionID;
+      state.catalog = previousCatalog;
+      state.connectingID = "";
       toast(error.message, "error");
+      if (destination === "connections") renderConnections();
+    } finally {
+      state.connectingID = "";
     }
   }
 
@@ -1594,10 +2148,41 @@ import { tags } from "@lezer/highlight";
       await changeConnection(target.dataset.connection, "connections");
     } else if (action === "show-connection-form") {
       state.connectionFormOpen = true;
+      resetConnectionAddFlow();
       renderConnections();
-      document.querySelector('#connection-form input[name="name"]')?.focus();
+      document.getElementById("connection-string-entry")?.focus();
+    } else if (action === "choose-connection-engine") {
+      state.connectionEngine = target.dataset.engine === "postgres" ? "postgres" : "sqlite";
+      state.connectionAddStep = "configure";
+      if (state.connectionEngine === "postgres") {
+        state.postgresFormTab = "general";
+        state.connectionDraft.connection_url = postgresURLFromDraft(state.connectionDraft);
+      }
+      state.connectionEntryError = "";
+      state.postgresDiscoveryError = "";
+      renderConnections();
+      document.getElementById("connection-name")?.focus();
+    } else if (action === "back-to-connection-types") {
+      state.connectionDraft = connectionDraftFromForm();
+      if (state.connectionEngine === "postgres") {
+        state.connectionDraft.connection_url = postgresURLFromDraft(state.connectionDraft);
+        state.connectionEntryURL = state.connectionDraft.connection_url;
+      }
+      state.connectionEntryError = "";
+      state.connectionAddStep = "choose";
+      renderConnections();
+      document.getElementById("connection-string-entry")?.focus();
+    } else if (action === "discover-postgres-databases") {
+      await discoverPostgresDatabases();
+    } else if (action === "select-postgres-form-tab") {
+      state.connectionDraft = connectionDraftFromForm();
+      state.connectionDraft.connection_url = postgresURLFromDraft(state.connectionDraft);
+      state.postgresFormTab = target.dataset.postgresTab === "security" ? "security" : "general";
+      renderConnections();
+      document.querySelector(`[data-postgres-tab="${state.postgresFormTab}"]`)?.focus();
     } else if (action === "cancel-connection-form") {
       state.connectionFormOpen = false;
+      resetConnectionAddFlow();
       renderConnections();
     }
   });
@@ -1627,39 +2212,100 @@ import { tags } from "@lezer/highlight";
       renderBrowse();
       return;
     }
+    if (event.target.id === "connection-entry-form") {
+      event.preventDefault();
+      applyConnectionEntryURL(event.target.elements.connection_string.value, true);
+      return;
+    }
     if (event.target.id !== "connection-form") return;
     event.preventDefault();
     const form = event.target;
     const submit = form.querySelector('button[type="submit"]');
     const errorNode = form.querySelector(".connection-form-error");
-    const fields = new FormData(form);
+    let draft = connectionDraftFromForm(form);
+    if (state.connectionEngine === "postgres") {
+      try {
+        draft = normalizedPostgresDraft(draft);
+      } catch (error) {
+        errorNode.textContent = `${error.message}. Correct the connection URL or edit the fields below.`;
+        errorNode.hidden = false;
+        setPostgresURLStatus(error.message, "error-copy");
+        return;
+      }
+      const requiredPostgresFields = [
+        ["host", "host"],
+        ["port", "port"],
+        ["username", "username"],
+        ["database", "database"],
+      ];
+      const missing = requiredPostgresFields.find(([name]) => !String(draft[name] || "").trim());
+      if (missing) {
+        state.connectionDraft = draft;
+        state.postgresFormTab = "general";
+        renderConnections();
+        const generalForm = document.getElementById("connection-form");
+        const generalError = generalForm?.querySelector(".connection-form-error");
+        if (generalError) {
+          generalError.textContent = `Enter the PostgreSQL ${missing[1]} before connecting.`;
+          generalError.hidden = false;
+        }
+        generalForm?.elements[missing[0]]?.focus();
+        return;
+      }
+    }
+    state.connectionDraft = draft;
     submit.disabled = true;
     submit.textContent = "Connecting…";
     errorNode.hidden = true;
     try {
+      const request = state.connectionEngine === "postgres"
+        ? postgresRequest(draft)
+        : {
+            name: draft.name,
+            engine: "sqlite",
+            data_source_name: draft.data_source_name,
+          };
       const response = await api("/api/v1/connections", {
         method: "POST",
-        body: JSON.stringify({
-          name: String(fields.get("name") || "").trim(),
-          engine: "sqlite",
-          data_source_name: String(fields.get("data_source_name") || "").trim(),
-        }),
+        body: JSON.stringify(request),
       });
       const connection = response.connection;
       state.connections.push(connection);
       state.connectionID = connection.id;
       state.connectionFormOpen = false;
+      state.connectionAddStep = "choose";
       state.snapshot = null;
       state.queryResult = null;
       state.queryError = "";
+      state.connectionDraft.password = "";
+      state.postgresDatabases = [];
       await loadCatalog(connection.id, true);
-      toast(`${state.meta?.features?.connection_persistence ? "Saved" : "Opened"} ${connection.name}`);
+      const persisted = connection.engine === "sqlite" && state.meta?.features?.connection_persistence;
+      toast(`${persisted ? "Saved" : "Opened"} ${connection.name}`);
       navigate("browse");
     } catch (error) {
-      errorNode.textContent = `${error.message}. Check the file path and try again.`;
+      errorNode.textContent = state.connectionEngine === "postgres"
+        ? `${error.message}. Check the endpoint, credentials, database, and SSL mode.`
+        : `${error.message}. Check the file path and try again.`;
       errorNode.hidden = false;
       submit.disabled = false;
-      submit.textContent = "Add connection";
+      submit.textContent = "Add and connect";
+    }
+  });
+
+  document.addEventListener("change", async event => {
+    if (event.target.id === "connection-picker") {
+      await changeConnection(event.target.value);
+    } else if (event.target.id === "connection-string-entry") {
+      applyConnectionEntryURL(event.target.value, true);
+    } else if (event.target.id === "postgres-url") {
+      applyPostgresURLToForm(event.target.value, true);
+    } else if (
+      event.target.form?.id === "connection-form" &&
+      state.connectionEngine === "postgres" &&
+      ["host", "port", "username", "password", "database", "ssl_mode"].includes(event.target.name)
+    ) {
+      syncPostgresURLFromForm();
     }
   });
 
@@ -1680,10 +2326,39 @@ import { tags } from "@lezer/highlight";
       const input = document.getElementById("table-search");
       input?.focus();
       if (input) input.selectionStart = input.selectionEnd = position;
+    } else if (event.target.id === "connection-string-entry") {
+      state.connectionEntryURL = event.target.value;
+      if (["insertFromPaste", "insertFromDrop"].includes(event.inputType)) {
+        applyConnectionEntryURL(event.target.value, true);
+      } else {
+        clearTimeout(state.connectionEntryTimer);
+        const value = event.target.value;
+        state.connectionEntryTimer = setTimeout(() => applyConnectionEntryURL(value, false, false), 240);
+      }
+    } else if (event.target.id === "postgres-url") {
+      if (["insertFromPaste", "insertFromDrop"].includes(event.inputType)) {
+        applyPostgresURLToForm(event.target.value, true);
+      } else {
+        clearTimeout(state.postgresURLTimer);
+        const value = event.target.value;
+        state.postgresURLTimer = setTimeout(() => applyPostgresURLToForm(value, false, false), 240);
+      }
+    } else if (
+      event.target.form?.id === "connection-form" &&
+      state.connectionEngine === "postgres" &&
+      ["host", "port", "username", "password", "database"].includes(event.target.name)
+    ) {
+      syncPostgresURLFromForm(false);
     }
   });
 
-  document.addEventListener("keydown", event => {
+  document.addEventListener("keydown", async event => {
+    if (event.target.matches?.('[role="tab"][data-postgres-tab]') && ["ArrowLeft", "ArrowRight"].includes(event.key)) {
+      event.preventDefault();
+      const nextTab = event.target.dataset.postgresTab === "general" ? "security" : "general";
+      document.querySelector(`[data-postgres-tab="${nextTab}"]`)?.click();
+      return;
+    }
     const connectionField = event.target.closest?.(".connection-picker");
     if (!connectionField) return;
     const menu = connectionField.querySelector(".connection-menu");

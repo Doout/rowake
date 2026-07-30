@@ -14,7 +14,7 @@ The imports live in `internal/db/drivers.go` with no build tags. Official and or
 
 Users select an archive only by operating system and CPU architecture. They never select a database-specific download.
 
-Driver registration and product adapters are separate concerns. The current UI and service adapter support SQLite. PostgreSQL and MySQL/MariaDB are registered and build-verified, with their connection and catalog adapters planned for later.
+Driver registration and product adapters are separate concerns. The current UI and service adapters support SQLite and PostgreSQL. MySQL/MariaDB is registered and build-verified, with its connection and catalog adapter planned for later.
 
 ## Why this is the default
 
@@ -30,7 +30,7 @@ Engine-specific behavior remains in small Rowake adapters rather than an ORM. Th
 
 1. The registry and `database/sql` both contain `mysql`, `pgx`, and `sqlite3`.
 2. SQLite creates, writes, and reads an in-memory database.
-3. PostgreSQL and MySQL connect to live service containers and execute `SELECT 1`.
+3. PostgreSQL connects to a live service container and exercises database discovery, catalogs, topology, table previews, indexes, and read-only queries. MySQL connects and executes `SELECT 1`.
 4. The source cross-compiles for all six release targets with `CGO_ENABLED=0`.
 5. The container builds and reports all three engines from inside the final image.
 6. A tag release produces six archives, checksums, and a manifest declaring the universal driver set.

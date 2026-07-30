@@ -22,6 +22,12 @@ type ConnectionRequest struct {
 	Name           string `json:"name"`
 	Engine         string `json:"engine"`
 	DataSourceName string `json:"data_source_name"`
+	Host           string `json:"host,omitempty"`
+	Port           int    `json:"port,omitempty"`
+	Username       string `json:"username,omitempty"`
+	Password       string `json:"password,omitempty"`
+	Database       string `json:"database,omitempty"`
+	SSLMode        string `json:"ssl_mode,omitempty"`
 }
 
 type Catalog struct {
@@ -46,8 +52,10 @@ type TopologyTable struct {
 
 type TopologyRelationship struct {
 	ID         string `json:"id"`
+	FromSchema string `json:"from_schema,omitempty"`
 	FromTable  string `json:"from_table"`
 	FromColumn string `json:"from_column"`
+	ToSchema   string `json:"to_schema,omitempty"`
 	ToTable    string `json:"to_table"`
 	ToColumn   string `json:"to_column"`
 	OnUpdate   string `json:"on_update,omitempty"`
@@ -119,6 +127,7 @@ type QueryResult struct {
 type Service interface {
 	Meta(context.Context) (Meta, error)
 	Connections(context.Context) ([]Connection, error)
+	Databases(context.Context, ConnectionRequest) ([]string, error)
 	AddConnection(context.Context, ConnectionRequest) (Connection, error)
 	Catalog(context.Context, string) (Catalog, error)
 	Topology(context.Context, string) (DatabaseTopology, error)
