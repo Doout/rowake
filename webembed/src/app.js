@@ -19,9 +19,12 @@ import { tags } from "@lezer/highlight";
 
   const app = document.getElementById("app");
   const toastRoot = document.getElementById("toast-root");
+  const cellValuePreview = document.getElementById("cell-value-preview");
   const cspNonce = document.querySelector('meta[name="csp-nonce"]')?.content || "";
   const queryLanguage = new Compartment();
   let queryEditorView = null;
+  let cellPreviewTarget = null;
+  let cellPreviewTimer = 0;
   const columnCompletionSection = { name: "Columns", rank: 0 };
   const tableCompletionSection = { name: "Tables", rank: 1 };
   const keywordCompletionSection = { name: "Keywords", rank: 2 };
@@ -852,9 +855,92 @@ import { tags } from "@lezer/highlight";
     if (value === null || value === undefined) return `<span class="null-value">NULL</span>`;
     if (typeof value === "boolean") return `<span class="boolean-value ${value ? "true" : "false"}">${value ? "true" : "false"}</span>`;
     const text = String(value);
-    if (/json/i.test(column.data_type || "") || ((text.startsWith("{") || text.startsWith("[")) && text.length > 2)) return `<span class="json-value" title="${html(text)}">${html(text)}</span>`;
+    const previewTabIndex = text.length > 48 ? ` tabindex="0"` : "";
+    if (/json/i.test(column.data_type || "") || ((text.startsWith("{") || text.startsWith("[")) && text.length > 2)) return `<span class="cell-value json-value" data-cell-preview data-preview-kind="json"${previewTabIndex}>${html(text)}</span>`;
     if (/int|decimal|numeric|real|double|float/i.test(column.data_type || "") && typeof value === "number") return `<span class="numeric-value">${html(value)}</span>`;
-    return `<span title="${html(text)}">${html(text)}</span>`;
+    return `<span class="cell-value" data-cell-preview data-preview-kind="text"${previewTabIndex}>${html(text)}</span>`;
+  }
+
+  function cellNeedsPreview(target) {
+    const text = target.textContent || "";
+    return text.length > 48 || text.includes("\n") || target.scrollWidth > target.clientWidth + 1;
+  }
+
+  function hideCellValuePreview() {
+    clearTimeout(cellPreviewTimer);
+    cellPreviewTimer = 0;
+    cellPreviewTarget?.removeAttribute("aria-describedby");
+    cellPreviewTarget = null;
+    if (!cellValuePreview) return;
+    cellValuePreview.hidden = true;
+    cellValuePreview.setAttribute("aria-hidden", "true");
+  }
+
+  function positionCellValuePreview(target) {
+    if (!cellValuePreview) return;
+    const targetRect = target.getBoundingClientRect();
+    const previewRect = cellValuePreview.getBoundingClientRect();
+    const viewportPadding = 12;
+    const gap = 10;
+    const spaceBelow = window.innerHeight - targetRect.bottom - viewportPadding;
+    const spaceAbove = targetRect.top - viewportPadding;
+    const placeBelow = spaceBelow >= previewRect.height + gap || spaceBelow >= spaceAbove;
+    const preferredTop = placeBelow
+      ? targetRect.bottom + gap
+      : targetRect.top - previewRect.height - gap;
+    const top = Math.min(
+      Math.max(viewportPadding, preferredTop),
+      Math.max(viewportPadding, window.innerHeight - previewRect.height - viewportPadding),
+    );
+    const preferredLeft = targetRect.left - 12;
+    const left = Math.min(
+      Math.max(viewportPadding, preferredLeft),
+      Math.max(viewportPadding, window.innerWidth - previewRect.width - viewportPadding),
+    );
+    const anchor = Math.min(
+      Math.max(18, targetRect.left + targetRect.width / 2 - left),
+      previewRect.width - 18,
+    );
+    cellValuePreview.dataset.placement = placeBelow ? "below" : "above";
+    cellValuePreview.style.setProperty("--cell-preview-anchor", `${anchor}px`);
+    cellValuePreview.style.left = `${left}px`;
+    cellValuePreview.style.top = `${top}px`;
+    cellValuePreview.style.visibility = "visible";
+  }
+
+  function showCellValuePreview(target) {
+    if (!cellValuePreview || !target.isConnected || !cellNeedsPreview(target)) return;
+    const rawText = target.textContent || "";
+    const kind = target.dataset.previewKind === "json" ? "json" : "text";
+    let previewText = rawText;
+    if (kind === "json") {
+      try {
+        previewText = JSON.stringify(JSON.parse(rawText), null, 2);
+      } catch (_) {
+        previewText = rawText;
+      }
+    }
+    const previewLimit = 12000;
+    const clipped = previewText.length > previewLimit;
+    const content = cellValuePreview.querySelector("[data-cell-preview-content]");
+    const type = cellValuePreview.querySelector("[data-cell-preview-type]");
+    const meta = cellValuePreview.querySelector("[data-cell-preview-meta]");
+    content.textContent = clipped ? `${previewText.slice(0, previewLimit)}\n…` : previewText;
+    type.textContent = kind === "json" ? "JSON value" : "Full value";
+    meta.textContent = `${rawText.length.toLocaleString()} chars${clipped ? " · preview clipped" : ""}`;
+    cellPreviewTarget = target;
+    target.setAttribute("aria-describedby", cellValuePreview.id);
+    cellValuePreview.style.visibility = "hidden";
+    cellValuePreview.hidden = false;
+    content.scrollTop = 0;
+    cellValuePreview.setAttribute("aria-hidden", "false");
+    positionCellValuePreview(target);
+  }
+
+  function queueCellValuePreview(target) {
+    if (target === cellPreviewTarget && !cellValuePreview?.hidden) return;
+    hideCellValuePreview();
+    cellPreviewTimer = window.setTimeout(() => showCellValuePreview(target), 140);
   }
 
   function renderStructure(snapshot) {
@@ -2416,7 +2502,28 @@ import { tags } from "@lezer/highlight";
     }
   });
 
+  document.addEventListener("pointerover", event => {
+    const target = event.target.closest?.("[data-cell-preview]");
+    if (target) queueCellValuePreview(target);
+  });
+
+  document.addEventListener("pointerout", event => {
+    const target = event.target.closest?.("[data-cell-preview]");
+    if (target && !target.contains(event.relatedTarget) && !cellValuePreview?.contains(event.relatedTarget)) hideCellValuePreview();
+  });
+
+  cellValuePreview?.addEventListener("pointerleave", event => {
+    if (!event.relatedTarget?.closest?.("[data-cell-preview]")) hideCellValuePreview();
+  });
+  document.addEventListener("pointerdown", event => {
+    if (!cellValuePreview?.contains(event.target)) hideCellValuePreview();
+  });
+  document.addEventListener("scroll", event => {
+    if (!cellValuePreview?.contains(event.target)) hideCellValuePreview();
+  }, true);
+
   document.addEventListener("keydown", async event => {
+    if (event.key === "Escape") hideCellValuePreview();
     const tableCell = event.target.closest?.(".data-cell");
     if (tableCell && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && !event.metaKey && !event.ctrlKey && !event.altKey) {
       event.preventDefault();
@@ -2479,8 +2586,16 @@ import { tags } from "@lezer/highlight";
 
   document.addEventListener("focusin", event => {
     if (!event.target.closest(".connection-picker")) closeConnectionMenu();
+    const target = event.target.closest?.("[data-cell-preview]");
+    if (target) queueCellValuePreview(target);
   });
-  window.addEventListener("resize", () => closeConnectionMenu());
+  document.addEventListener("focusout", event => {
+    if (event.target.closest?.("[data-cell-preview]")) hideCellValuePreview();
+  });
+  window.addEventListener("resize", () => {
+    closeConnectionMenu();
+    hideCellValuePreview();
+  });
   window.addEventListener("hashchange", renderRoute);
   bootstrap();
 })();
