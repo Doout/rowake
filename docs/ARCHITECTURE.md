@@ -8,10 +8,13 @@ internal/service/    Session connections and SQLite viewer adapter
 internal/db/         database/sql boundary and driver registration
 internal/launch/     Shared loopback server lifecycle
 internal/server/     HTTP API and embedded web serving
-webembed/dist/       Dependency-free browser interface
+webembed/src/        Browser interface source and SQL editor integration
+webembed/dist/       Prebuilt, dependency-free browser assets embedded by Go
 ```
 
 The CLI and Wails app start the same loopback HTTP server. The Wails WebView navigates to that local origin, so desktop and browser modes use one interface and API.
+
+The browser interface uses CodeMirror's SQL package for dialect-aware editing and schema completion. `npm run build:web` bundles it into `webembed/dist/app.js`; normal Go and release builds consume the committed bundle and do not need Node.js or a CDN.
 
 ## Service boundary
 

@@ -8,7 +8,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.bui
 WAILS_VERSION ?= v2.13.0
 WAILS_BIN ?= $(shell go env GOPATH)/bin/wails
 
-.PHONY: build run desktop desktop-install desktop-build desktop-dev check test race test-db integration fmt clean smoke drivers driver-check release cross-build docker vuln vuln-install
+.PHONY: build web-build run desktop desktop-install desktop-build desktop-dev check test race test-db integration fmt clean smoke drivers driver-check release cross-build docker vuln vuln-install
 
 GOVULNCHECK_VERSION ?= v1.6.0
 GOVULNCHECK_BIN ?= $(shell go env GOPATH)/bin/govulncheck
@@ -16,6 +16,10 @@ GOVULNCHECK_BIN ?= $(shell go env GOPATH)/bin/govulncheck
 build:
 	mkdir -p bin
 	CGO_ENABLED=0 $(GO) build -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o bin/rowake ./cmd/rowake
+
+web-build:
+	npm ci
+	npm run build:web
 
 run:
 	$(GO) run ./cmd/rowake open

@@ -362,11 +362,10 @@ select { appearance: none; padding-right: 30px; background-image: linear-gradien
 .editor-header strong, .query-results-header strong { color: #dce3ea; font-size: 10px; font-weight: 640; }
 .editor-header small { color: #68737e; }
 .editor-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--yellow); }
-.sql-editor { min-height: 0; flex: 1 1 auto; display: grid; grid-template-columns: 44px minmax(0, 1fr); overflow: hidden; }
-.line-gutter { padding: 15px 9px 15px 0; border-right: 1px solid #202832; background: #0c1014; color: #4f5a66; display: grid; align-content: start; gap: 0; text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.7; user-select: none; }
-.line-gutter span { height: 18.7px; }
-.sql-editor textarea { min-height: 0; height: 100%; padding: 15px 17px; border: 0; border-radius: 0; background: #0d1115; color: #dce3ea; resize: none; outline: none; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; line-height: 1.7; tab-size: 2; }
-.editor-foot { min-height: 25px; padding: 0 11px; border-top: 1px solid #202832; background: #101419; color: #65717d; display: flex; align-items: center; justify-content: flex-end; gap: 16px; font-size: 8px; }
+.sql-editor { min-height: 0; flex: 1 1 auto; overflow: hidden; }
+.sql-editor > .cm-editor { height: 100%; }
+.editor-foot { min-height: 25px; padding: 0 11px; border-top: 1px solid #202832; background: #101419; color: #65717d; display: flex; align-items: center; justify-content: space-between; gap: 16px; font-size: 8px; }
+.editor-foot > div { min-width: 0; display: flex; align-items: center; gap: 16px; white-space: nowrap; }
 .query-results-panel { min-height: 0; background: var(--bg); display: flex; flex-direction: column; overflow: hidden; }
 .query-results-header { min-height: 41px; }
 .query-results-header .btn { margin-left: 4px; }

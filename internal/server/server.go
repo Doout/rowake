@@ -1,6 +1,9 @@
 package server
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +17,10 @@ import (
 	"github.com/Doout/rowake/internal/app"
 	"github.com/Doout/rowake/webembed"
 )
+
+type contextKey string
+
+const cspNonceKey contextKey = "csp-nonce"
 
 type Server struct {
 	service app.Service
@@ -55,13 +62,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "index.html"
 	}
+	if path == "index.html" {
+		s.serveIndex(w, r)
+		return
+	}
 	if info, err := fs.Stat(s.dist, path); err == nil && !info.IsDir() {
 		s.static.ServeHTTP(w, r)
 		return
 	}
-	clone := r.Clone(r.Context())
-	clone.URL.Path = "/"
-	s.static.ServeHTTP(w, clone)
+	s.serveIndex(w, r)
+}
+
+func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
+	content, err := fs.ReadFile(s.dist, "index.html")
+	if err != nil {
+		http.Error(w, "Rowake interface is unavailable", http.StatusInternalServerError)
+		return
+	}
+	nonce, _ := r.Context().Value(cspNonceKey).(string)
+	content = []byte(strings.ReplaceAll(string(content), "{{CSP_NONCE}}", nonce))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(content)
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -204,13 +226,26 @@ func (s *Server) writeError(w http.ResponseWriter, status int, err error) {
 
 func (s *Server) withHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		nonce, err := newCSPNonce()
+		if err != nil {
+			http.Error(w, "could not secure response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Security-Policy", fmt.Sprintf("default-src 'self'; img-src 'self' data:; style-src 'self' 'nonce-%s'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", nonce))
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), cspNonceKey, nonce)))
 	})
+}
+
+func newCSPNonce() (string, error) {
+	value := make([]byte, 18)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(value), nil
 }
 
 func (s *Server) withLog(next http.Handler) http.Handler {
