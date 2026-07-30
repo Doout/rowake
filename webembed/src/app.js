@@ -20,6 +20,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
 
   const app = document.getElementById("app");
   const toastRoot = document.getElementById("toast-root");
+  const cellValuePreview = document.getElementById("cell-value-preview");
   const cspNonce = document.querySelector('meta[name="csp-nonce"]')?.content || "";
   const queryLanguage = new Compartment();
   let queryEditorView = null;
@@ -30,6 +31,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
   let valueFormatGeneration = 0;
   let valueFormatSerial = 0;
   const valueFormatBudgetMS = 4;
+  let cellPreviewTarget = null;
+  let cellPreviewTimer = 0;
+  const cellRawValues = new WeakMap();
   const columnCompletionSection = { name: "Columns", rank: 0 };
   const tableCompletionSection = { name: "Tables", rank: 1 };
   const keywordCompletionSection = { name: "Keywords", rank: 2 };
@@ -244,13 +248,13 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
   }
 
   function applyCellFormat(element, formatted) {
-    element.className = valueFormatClass(formatted);
+    element.className = `cell-value ${valueFormatClass(formatted)}`;
     element.textContent = formatted.display;
+    element.dataset.previewKind = formatted.kind === "json" ? "json" : "text";
+    cellRawValues.set(element, formatted.raw);
     if (formatted.changed) {
-      element.title = `Raw value: ${formatted.raw}`;
       element.setAttribute("aria-label", `${formatted.display}. Raw value: ${formatted.raw}`);
     } else {
-      element.removeAttribute("title");
       element.removeAttribute("aria-label");
     }
   }
@@ -954,7 +958,91 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
   function formatCell(value, column = {}) {
     const pending = queueValueFormat(value, column, "cell");
     const nullState = value === null || value === undefined ? " null-value" : "";
-    return `<span id="${pending.id}" class="formatted-value value-format-pending${nullState}">${html(pending.raw)}</span>`;
+    const previewTabIndex = pending.raw.length > 48 ? ` tabindex="0"` : "";
+    return `<span id="${pending.id}" class="cell-value formatted-value value-format-pending${nullState}" data-cell-preview data-preview-kind="text"${previewTabIndex}>${html(pending.raw)}</span>`;
+  }
+
+  function cellNeedsPreview(target) {
+    const displayedText = target.textContent || "";
+    const rawText = cellRawValues.get(target) ?? displayedText;
+    return rawText !== displayedText || rawText.length > 48 || rawText.includes("\n") || target.scrollWidth > target.clientWidth + 1;
+  }
+
+  function hideCellValuePreview() {
+    clearTimeout(cellPreviewTimer);
+    cellPreviewTimer = 0;
+    cellPreviewTarget?.removeAttribute("aria-describedby");
+    cellPreviewTarget = null;
+    if (!cellValuePreview) return;
+    cellValuePreview.hidden = true;
+    cellValuePreview.setAttribute("aria-hidden", "true");
+  }
+
+  function positionCellValuePreview(target) {
+    if (!cellValuePreview) return;
+    const targetRect = target.getBoundingClientRect();
+    const previewRect = cellValuePreview.getBoundingClientRect();
+    const viewportPadding = 12;
+    const gap = 10;
+    const spaceBelow = window.innerHeight - targetRect.bottom - viewportPadding;
+    const spaceAbove = targetRect.top - viewportPadding;
+    const placeBelow = spaceBelow >= previewRect.height + gap || spaceBelow >= spaceAbove;
+    const preferredTop = placeBelow
+      ? targetRect.bottom + gap
+      : targetRect.top - previewRect.height - gap;
+    const top = Math.min(
+      Math.max(viewportPadding, preferredTop),
+      Math.max(viewportPadding, window.innerHeight - previewRect.height - viewportPadding),
+    );
+    const preferredLeft = targetRect.left - 12;
+    const left = Math.min(
+      Math.max(viewportPadding, preferredLeft),
+      Math.max(viewportPadding, window.innerWidth - previewRect.width - viewportPadding),
+    );
+    const anchor = Math.min(
+      Math.max(18, targetRect.left + targetRect.width / 2 - left),
+      previewRect.width - 18,
+    );
+    cellValuePreview.dataset.placement = placeBelow ? "below" : "above";
+    cellValuePreview.style.setProperty("--cell-preview-anchor", `${anchor}px`);
+    cellValuePreview.style.left = `${left}px`;
+    cellValuePreview.style.top = `${top}px`;
+    cellValuePreview.style.visibility = "visible";
+  }
+
+  function showCellValuePreview(target) {
+    if (!cellValuePreview || !target.isConnected || !cellNeedsPreview(target)) return;
+    const rawText = cellRawValues.get(target) ?? target.textContent ?? "";
+    const kind = target.dataset.previewKind === "json" ? "json" : "text";
+    let previewText = rawText;
+    if (kind === "json") {
+      try {
+        previewText = JSON.stringify(JSON.parse(rawText), null, 2);
+      } catch (_) {
+        previewText = rawText;
+      }
+    }
+    const previewLimit = 12000;
+    const clipped = previewText.length > previewLimit;
+    const content = cellValuePreview.querySelector("[data-cell-preview-content]");
+    const type = cellValuePreview.querySelector("[data-cell-preview-type]");
+    const meta = cellValuePreview.querySelector("[data-cell-preview-meta]");
+    content.textContent = clipped ? `${previewText.slice(0, previewLimit)}\n…` : previewText;
+    type.textContent = kind === "json" ? "Raw JSON value" : "Raw value";
+    meta.textContent = `${rawText.length.toLocaleString()} chars${clipped ? " · preview clipped" : ""}`;
+    cellPreviewTarget = target;
+    target.setAttribute("aria-describedby", cellValuePreview.id);
+    cellValuePreview.style.visibility = "hidden";
+    cellValuePreview.hidden = false;
+    content.scrollTop = 0;
+    cellValuePreview.setAttribute("aria-hidden", "false");
+    positionCellValuePreview(target);
+  }
+
+  function queueCellValuePreview(target) {
+    if (target === cellPreviewTarget && !cellValuePreview?.hidden) return;
+    hideCellValuePreview();
+    cellPreviewTimer = window.setTimeout(() => showCellValuePreview(target), 140);
   }
 
   function renderStructure(snapshot) {
@@ -2511,7 +2599,28 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     }
   });
 
+  document.addEventListener("pointerover", event => {
+    const target = event.target.closest?.("[data-cell-preview]");
+    if (target) queueCellValuePreview(target);
+  });
+
+  document.addEventListener("pointerout", event => {
+    const target = event.target.closest?.("[data-cell-preview]");
+    if (target && !target.contains(event.relatedTarget) && !cellValuePreview?.contains(event.relatedTarget)) hideCellValuePreview();
+  });
+
+  cellValuePreview?.addEventListener("pointerleave", event => {
+    if (!event.relatedTarget?.closest?.("[data-cell-preview]")) hideCellValuePreview();
+  });
+  document.addEventListener("pointerdown", event => {
+    if (!cellValuePreview?.contains(event.target)) hideCellValuePreview();
+  });
+  document.addEventListener("scroll", event => {
+    if (!cellValuePreview?.contains(event.target)) hideCellValuePreview();
+  }, true);
+
   document.addEventListener("keydown", async event => {
+    if (event.key === "Escape") hideCellValuePreview();
     const tableCell = event.target.closest?.(".data-cell");
     if (tableCell && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && !event.metaKey && !event.ctrlKey && !event.altKey) {
       event.preventDefault();
@@ -2574,8 +2683,16 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
 
   document.addEventListener("focusin", event => {
     if (!event.target.closest(".connection-picker")) closeConnectionMenu();
+    const target = event.target.closest?.("[data-cell-preview]");
+    if (target) queueCellValuePreview(target);
   });
-  window.addEventListener("resize", () => closeConnectionMenu());
+  document.addEventListener("focusout", event => {
+    if (event.target.closest?.("[data-cell-preview]")) hideCellValuePreview();
+  });
+  window.addEventListener("resize", () => {
+    closeConnectionMenu();
+    hideCellValuePreview();
+  });
   window.addEventListener("hashchange", renderRoute);
   bootstrap();
 })();
