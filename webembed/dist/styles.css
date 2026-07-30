@@ -352,11 +352,96 @@ select { appearance: none; padding-right: 30px; background-image: linear-gradien
 .result-grid td.row-number { position: sticky; left: 0; z-index: 2; min-width: 42px; width: 42px; padding: 0; color: #65717d; text-align: center; font-size: 8px; }
 .result-grid .selectable-row { cursor: pointer; }
 .result-grid .grid-empty { height: 120px; color: var(--muted); text-align: center; font-family: inherit; }
+.cell-value { min-width: 0; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-value[data-cell-preview] { cursor: help; transition: color .12s ease; }
+.cell-value[data-cell-preview]:hover { color: #edf2f7; }
+.cell-value[data-cell-preview]:focus-visible { border-radius: 2px; outline: 1px solid var(--accent); outline-offset: 2px; }
 .numeric-value { color: #b9d3f8; }
 .null-value { color: #697582; font-size: 8px; font-style: italic; }
 .boolean-value { color: #d3bc86; }
 .boolean-value.true { color: #9ed8ba; }
 .json-value { color: #c4acd9; }
+.cell-value.json-value:hover { color: #ddc9ed; }
+.cell-value-preview {
+  --cell-preview-anchor: 28px;
+  position: fixed;
+  z-index: 220;
+  width: min(520px, calc(100vw - 24px));
+  border: 1px solid #3b4857;
+  border-radius: 8px;
+  background: #151b22;
+  color: #d9e0e7;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, .52);
+  pointer-events: auto;
+  user-select: text;
+  animation: cell-preview-in .14s cubic-bezier(.16, 1, .3, 1);
+}
+.cell-value-preview::before {
+  content: "";
+  position: absolute;
+  right: 0;
+  left: 0;
+  height: 10px;
+}
+.cell-value-preview[data-placement="below"]::before { top: -10px; }
+.cell-value-preview[data-placement="above"]::before { bottom: -10px; }
+.cell-value-preview::after {
+  content: "";
+  position: absolute;
+  left: calc(var(--cell-preview-anchor) - 6px);
+  width: 10px;
+  height: 10px;
+  background: #151b22;
+  transform: rotate(45deg);
+}
+.cell-value-preview[data-placement="below"]::after {
+  top: -6px;
+  border-top: 1px solid #3b4857;
+  border-left: 1px solid #3b4857;
+}
+.cell-value-preview[data-placement="above"]::after {
+  bottom: -6px;
+  border-right: 1px solid #3b4857;
+  border-bottom: 1px solid #3b4857;
+}
+.cell-value-preview header {
+  min-height: 34px;
+  padding: 0 12px;
+  border-bottom: 1px solid #2b3540;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.cell-value-preview-type {
+  color: #a9caf7;
+  font-size: 9px;
+  font-weight: 720;
+  letter-spacing: .075em;
+  text-transform: uppercase;
+}
+.cell-value-preview-meta {
+  color: #7f8b97;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cell-value-preview pre {
+  max-height: min(300px, calc(100vh - 92px));
+  margin: 0;
+  padding: 12px 14px 14px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  color: #d9e0e7;
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+  white-space: pre-wrap;
+}
+@keyframes cell-preview-in {
+  from { opacity: 0; transform: translateY(3px) scale(.99); }
+}
 .result-status { min-height: 31px; padding: 0 11px 0 13px; border-top: 1px solid var(--border); background: #101419; color: var(--subtle); display: flex; align-items: center; justify-content: space-between; gap: 18px; font-size: 9px; font-variant-numeric: tabular-nums; }
 .result-status > div { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
 .result-status strong { color: #d6dde4; font-weight: 630; }
@@ -655,7 +740,7 @@ select { appearance: none; padding-right: 30px; background-image: linear-gradien
 .engine-tile.mysql { border-color: #68522c; background: #2a2215; color: #efce8e; }
 @keyframes connection-list-in { from { opacity: .68; clip-path: inset(0 0 9% 0); transform: translateY(5px); } }
 @media (prefers-reduced-motion: reduce) {
-  .connection-editor, .connection-list { animation: none; }
+  .connection-editor, .connection-list, .cell-value-preview { animation: none; }
 }
 /* Toast */
 .toast-root { position: fixed; z-index: 150; right: 18px; bottom: 18px; width: min(370px, calc(100vw - 36px)); display: grid; gap: 8px; pointer-events: none; }
