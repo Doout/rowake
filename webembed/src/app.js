@@ -375,13 +375,102 @@ import { tags } from "@lezer/highlight";
     if (!state.connections.length) {
       return `<button type="button" class="btn" data-nav="connections">Connections</button>`;
     }
-    return `<label class="connection-picker compact">
-      <span class="sr-only">Connection</span>
-      <span class="picker-signal engine-dot ${html(currentConnection()?.engine || "")}"></span>
-      <select id="connection-picker" aria-label="Database connection">
-        ${state.connections.map(connection => `<option value="${html(connection.id)}" ${connection.id === state.connectionID ? "selected" : ""}>${html(connection.name)}</option>`).join("")}
-      </select>
-    </label>`;
+    const menuID = "connection-picker-menu";
+    const optionsID = `${menuID}-options`;
+    const connection = currentConnection();
+    return `<div class="connection-picker compact">
+      <span class="picker-signal engine-dot ${html(connection?.engine || "")}"></span>
+      <button type="button" class="connection-menu-trigger" data-action="toggle-connection-picker" aria-label="Connection: ${html(connection?.name || "")}" title="${html(connection?.name || "")}" aria-haspopup="dialog" aria-controls="${menuID}" aria-expanded="false">
+        <span data-connection-menu-label>${html(connection?.name || "")}</span><span class="connection-menu-chevron" aria-hidden="true"></span>
+      </button>
+      <div id="${menuID}" class="connection-menu" role="dialog" aria-label="Choose connection" hidden>
+        <label class="connection-menu-search">
+          <svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"></circle><path d="m12.6 12.6 4 4"></path></svg>
+          <input type="search" role="combobox" aria-autocomplete="list" aria-controls="${optionsID}" aria-expanded="true" autocomplete="off" placeholder="Search connections…" aria-label="Search connections" data-connection-menu-search>
+          <button type="button" class="connection-menu-search-clear" data-action="clear-connection-search" aria-label="Clear search" hidden>×</button>
+        </label>
+        <div class="connection-menu-results-meta" data-connection-menu-summary>${state.connections.length} option${state.connections.length === 1 ? "" : "s"}</div>
+        <div id="${optionsID}" role="listbox" aria-label="Connection options" data-connection-menu-options>
+          ${state.connections.map(item => {
+            const selected = item.id === state.connectionID;
+            const search = `${item.name} ${item.database || ""} ${engineLabel(item.engine)}`.toLowerCase();
+            return `<button type="button" class="connection-menu-option ${selected ? "selected" : ""}" role="option" aria-selected="${selected}" data-action="select-connection-option" data-value="${html(item.id)}" data-search="${html(search)}" title="${html(item.name)}"><span><strong>${html(item.name)}</strong><small>${html(engineLabel(item.engine))} · ${html(item.database || item.address || "")}</small></span><span class="connection-menu-check" aria-hidden="true">✓</span></button>`;
+          }).join("")}
+        </div>
+        <div class="connection-menu-empty" data-connection-menu-empty hidden>
+          <span class="connection-menu-empty-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"></circle><path d="m12.6 12.6 4 4"></path></svg></span>
+          <strong>No connections found</strong>
+          <span>Try another search.</span>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  function filterConnectionMenuOptions(field, query) {
+    if (!field) return [];
+    const needle = String(query || "").trim().toLowerCase();
+    const visible = [];
+    field.querySelectorAll(".connection-menu-option").forEach(option => {
+      const matches = !needle || String(option.dataset.search || option.textContent || "").toLowerCase().includes(needle);
+      option.hidden = !matches;
+      if (matches) visible.push(option);
+    });
+    const empty = field.querySelector("[data-connection-menu-empty]");
+    if (empty) empty.hidden = visible.length > 0;
+    const summary = field.querySelector("[data-connection-menu-summary]");
+    if (summary) {
+      const total = field.querySelectorAll(".connection-menu-option").length;
+      summary.textContent = needle
+        ? `${visible.length} result${visible.length === 1 ? "" : "s"}`
+        : `${total} option${total === 1 ? "" : "s"}`;
+    }
+    const clear = field.querySelector(".connection-menu-search-clear");
+    if (clear) clear.hidden = !needle;
+    return visible;
+  }
+
+  function focusConnectionMenuSearch(field, initialValue = "") {
+    const search = field?.querySelector("[data-connection-menu-search]");
+    if (!search) return;
+    search.value = initialValue;
+    filterConnectionMenuOptions(field, initialValue);
+    requestAnimationFrame(() => {
+      search.focus();
+      search.setSelectionRange(search.value.length, search.value.length);
+    });
+  }
+
+  function closeConnectionMenu(restoreFocus = false) {
+    const field = document.querySelector(".connection-picker");
+    const menu = field?.querySelector(".connection-menu");
+    const trigger = field?.querySelector(".connection-menu-trigger");
+    if (!field || !menu || menu.hidden) return;
+    menu.hidden = true;
+    field.classList.remove("opens-up");
+    menu.style.transform = "";
+    trigger?.setAttribute("aria-expanded", "false");
+    if (restoreFocus) trigger?.focus();
+  }
+
+  function toggleConnectionMenu(field, forceOpen, focusSearch = false) {
+    if (!field) return;
+    const menu = field.querySelector(".connection-menu");
+    const trigger = field.querySelector(".connection-menu-trigger");
+    if (!menu || !trigger) return;
+    const open = forceOpen ?? menu.hidden;
+    closeConnectionMenu();
+    if (!open) return;
+    const bounds = field.getBoundingClientRect();
+    const roomBelow = window.innerHeight - bounds.bottom;
+    field.classList.toggle("opens-up", roomBelow < Math.min(360, window.innerHeight * .64) && bounds.top > roomBelow);
+    menu.hidden = false;
+    const menuBounds = menu.getBoundingClientRect();
+    const horizontalShift = menuBounds.left < 12
+      ? 12 - menuBounds.left
+      : menuBounds.right > window.innerWidth - 12 ? window.innerWidth - 12 - menuBounds.right : 0;
+    menu.style.transform = horizontalShift ? `translateX(${horizontalShift}px)` : "";
+    trigger.setAttribute("aria-expanded", "true");
+    if (focusSearch) focusConnectionMenuSearch(field);
   }
 
   function renderBrowse() {
@@ -1368,6 +1457,7 @@ import { tags } from "@lezer/highlight";
   }
 
   document.addEventListener("click", async event => {
+    if (!event.target.closest(".connection-picker")) closeConnectionMenu();
     const nav = event.target.closest("[data-nav]");
     if (nav) {
       navigate(nav.dataset.nav);
@@ -1381,6 +1471,19 @@ import { tags } from "@lezer/highlight";
     if (action === "toggle-sidebar") {
       state.sidebarCollapsed = !state.sidebarCollapsed;
       await renderRoute();
+    } else if (action === "toggle-connection-picker") {
+      toggleConnectionMenu(target.closest(".connection-picker"), undefined, true);
+    } else if (action === "clear-connection-search") {
+      const field = target.closest(".connection-picker");
+      const search = field?.querySelector("[data-connection-menu-search]");
+      if (search) {
+        search.value = "";
+        filterConnectionMenuOptions(field, "");
+        search.focus();
+      }
+    } else if (action === "select-connection-option") {
+      closeConnectionMenu();
+      await changeConnection(target.dataset.value);
     } else if (action === "select-table") {
       state.selected = { schema: target.dataset.schema, table: target.dataset.table };
       state.tableTab = "data";
@@ -1560,14 +1663,10 @@ import { tags } from "@lezer/highlight";
     }
   });
 
-  document.addEventListener("change", async event => {
-    if (event.target.id === "connection-picker") {
-      await changeConnection(event.target.value);
-    }
-  });
-
   document.addEventListener("input", event => {
-    if (event.target.id === "catalog-search") {
+    if (event.target.matches("[data-connection-menu-search]")) {
+      filterConnectionMenuOptions(event.target.closest(".connection-picker"), event.target.value);
+    } else if (event.target.id === "catalog-search") {
       state.catalogSearch = event.target.value;
       const position = event.target.selectionStart;
       renderBrowse();
@@ -1584,6 +1683,59 @@ import { tags } from "@lezer/highlight";
     }
   });
 
+  document.addEventListener("keydown", event => {
+    const connectionField = event.target.closest?.(".connection-picker");
+    if (!connectionField) return;
+    const menu = connectionField.querySelector(".connection-menu");
+    const options = [...connectionField.querySelectorAll(".connection-menu-option")].filter(option => !option.hidden);
+    const option = event.target.closest(".connection-menu-option");
+    const optionIndex = options.indexOf(option);
+    const search = event.target.closest("[data-connection-menu-search]");
+    if (event.key === "Escape" && menu && !menu.hidden) {
+      event.preventDefault();
+      closeConnectionMenu(true);
+      return;
+    }
+    if (search && ["ArrowDown", "ArrowUp"].includes(event.key) && options.length) {
+      event.preventDefault();
+      options[event.key === "ArrowDown" ? 0 : options.length - 1]?.focus();
+      return;
+    }
+    if (search && event.key === "Enter" && options.length) {
+      event.preventDefault();
+      options[0].click();
+      return;
+    }
+    if (event.target.matches(".connection-menu-trigger") && event.key.length === 1 && event.key !== " " && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      toggleConnectionMenu(connectionField, true);
+      focusConnectionMenuSearch(connectionField, event.key);
+      return;
+    }
+    if (event.target.matches(".connection-menu-trigger") && ["ArrowDown", "ArrowUp"].includes(event.key)) {
+      event.preventDefault();
+      toggleConnectionMenu(connectionField, true);
+      requestAnimationFrame(() => {
+        const selected = options.find(item => item.classList.contains("selected"));
+        (selected || options[event.key === "ArrowDown" ? 0 : options.length - 1])?.focus();
+      });
+      return;
+    }
+    if (option && options.length && ["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      let nextIndex = optionIndex;
+      if (event.key === "ArrowDown") nextIndex = (optionIndex + 1) % options.length;
+      if (event.key === "ArrowUp") nextIndex = (optionIndex - 1 + options.length) % options.length;
+      if (event.key === "Home") nextIndex = 0;
+      if (event.key === "End") nextIndex = options.length - 1;
+      options[nextIndex]?.focus();
+    }
+  });
+
+  document.addEventListener("focusin", event => {
+    if (!event.target.closest(".connection-picker")) closeConnectionMenu();
+  });
+  window.addEventListener("resize", () => closeConnectionMenu());
   window.addEventListener("hashchange", renderRoute);
   bootstrap();
 })();
