@@ -35,6 +35,7 @@ import { tags } from "@lezer/highlight";
     selected: { schema: "", table: "" },
     snapshot: null,
     selectedRow: 0,
+    selectedColumn: 0,
     inspectorOpen: false,
     sidebarCollapsed: window.matchMedia("(max-width: 980px)").matches,
     tableTab: "data",
@@ -385,6 +386,7 @@ import { tags } from "@lezer/highlight";
       });
       state.snapshot = await api(`/api/v1/table?${params}`);
       state.selectedRow = 0;
+      state.selectedColumn = 0;
       state.inspectorOpen = false;
       state.tableSearch = "";
       state.tableFilters = [];
@@ -756,6 +758,10 @@ import { tags } from "@lezer/highlight";
     const rows = filteredRows(snapshot);
     const selectedVisible = rows.some(item => item.index === state.selectedRow);
     if (!selectedVisible && rows.length) state.selectedRow = rows[0].index;
+    state.selectedColumn = Math.min(
+      Math.max(Number.isInteger(state.selectedColumn) ? state.selectedColumn : 0, 0),
+      Math.max(snapshot.columns.length - 1, 0)
+    );
     return `<div class="data-instrument">
       <div class="data-toolbar">
         <div class="row-search"><span>⌕</span><input id="table-search" type="search" placeholder="Filter loaded rows" value="${html(state.tableSearch)}"></div>
@@ -768,12 +774,15 @@ import { tags } from "@lezer/highlight";
       </div>
       ${renderDataControl(snapshot)}
       <div class="grid-scroll">
-        <table class="result-grid">
+        <table class="result-grid" aria-label="Table data. Select a data cell, then use the arrow keys to move between cells.">
           <thead><tr><th class="row-number-head">#</th>${snapshot.columns.map(column => `<th><button type="button" class="column-header-control" data-action="sort-column" data-column="${html(column.name)}"><span>${html(column.name)}${state.tableSort?.column === column.name ? `<i>${state.tableSort.direction === "desc" ? "↓" : "↑"}</i>` : ""}</span><small>${html(column.data_type)}</small></button></th>`).join("")}</tr></thead>
           <tbody>
             ${rows.map(({ row, index }, visibleIndex) => `<tr class="selectable-row ${index === state.selectedRow ? "selected" : ""}" data-action="select-row" data-row="${index}">
               <td class="row-number">${visibleIndex + 1}</td>
-              ${row.map((value, columnIndex) => `<td>${formatCell(value, snapshot.columns[columnIndex])}</td>`).join("")}
+              ${row.map((value, columnIndex) => {
+                const active = index === state.selectedRow && columnIndex === state.selectedColumn;
+                return `<td class="data-cell ${active ? "active-cell" : ""}" data-action="select-cell" data-row="${index}" data-column="${columnIndex}" tabindex="${active ? "0" : "-1"}">${formatCell(value, snapshot.columns[columnIndex])}</td>`;
+              }).join("")}
             </tr>`).join("") || `<tr><td class="grid-empty" colspan="${snapshot.columns.length + 1}">No loaded rows match the current search and filters.</td></tr>`}
           </tbody>
         </table>
@@ -783,6 +792,60 @@ import { tags } from "@lezer/highlight";
         <div><span>${snapshot.duration_ms} ms</span><i></i><span>${snapshot.truncated ? "bounded result" : "complete result"}</span><i></i><span>${snapshot.capabilities.can_write ? "write enabled" : "read-only"}</span></div>
       </footer>
     </div>`;
+  }
+
+  function selectTableCell(rowIndex, columnIndex) {
+    const snapshot = state.snapshot;
+    if (
+      !Number.isInteger(rowIndex) ||
+      !Number.isInteger(columnIndex) ||
+      !snapshot?.rows?.[rowIndex] ||
+      !snapshot.columns.length
+    ) return;
+    const rows = filteredRows(snapshot);
+    if (!rows.some(item => item.index === rowIndex)) return;
+
+    const currentScroll = document.querySelector(".data-instrument > .grid-scroll");
+    const scrollPosition = currentScroll
+      ? { top: currentScroll.scrollTop, left: currentScroll.scrollLeft }
+      : null;
+    state.selectedRow = rowIndex;
+    state.selectedColumn = Math.min(Math.max(columnIndex, 0), snapshot.columns.length - 1);
+    renderBrowse();
+
+    requestAnimationFrame(() => {
+      const nextScroll = document.querySelector(".data-instrument > .grid-scroll");
+      if (nextScroll && scrollPosition) {
+        nextScroll.scrollTop = scrollPosition.top;
+        nextScroll.scrollLeft = scrollPosition.left;
+      }
+      const cell = nextScroll?.querySelector(
+        `.data-cell[data-row="${state.selectedRow}"][data-column="${state.selectedColumn}"]`
+      );
+      cell?.focus({ preventScroll: true });
+      cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+  }
+
+  function moveTableCell(cell, key) {
+    const snapshot = state.snapshot;
+    if (!snapshot?.columns?.length) return;
+    const rows = filteredRows(snapshot);
+    const rowIndex = Number(cell.dataset.row);
+    const columnIndex = Number(cell.dataset.column);
+    const visibleRowIndex = rows.findIndex(item => item.index === rowIndex);
+    if (visibleRowIndex < 0 || !Number.isInteger(columnIndex)) return;
+
+    let nextVisibleRow = visibleRowIndex;
+    let nextColumn = columnIndex;
+    if (key === "ArrowUp") nextVisibleRow = Math.max(visibleRowIndex - 1, 0);
+    if (key === "ArrowDown") nextVisibleRow = Math.min(visibleRowIndex + 1, rows.length - 1);
+    if (key === "ArrowLeft") nextColumn = Math.max(columnIndex - 1, 0);
+    if (key === "ArrowRight") nextColumn = Math.min(columnIndex + 1, snapshot.columns.length - 1);
+
+    const nextRow = rows[nextVisibleRow]?.index;
+    if (nextRow === undefined || (nextRow === rowIndex && nextColumn === columnIndex)) return;
+    selectTableCell(nextRow, nextColumn);
   }
 
   function formatCell(value, column = {}) {
@@ -2048,9 +2111,10 @@ import { tags } from "@lezer/highlight";
     } else if (action === "select-table-tab") {
       state.tableTab = target.dataset.tab;
       renderBrowse();
+    } else if (action === "select-cell") {
+      selectTableCell(Number(target.dataset.row), Number(target.dataset.column));
     } else if (action === "select-row") {
-      state.selectedRow = Number(target.dataset.row || 0);
-      renderBrowse();
+      selectTableCell(Number(target.dataset.row || 0), state.selectedColumn);
     } else if (action === "toggle-inspector") {
       state.inspectorOpen = !state.inspectorOpen;
       renderBrowse();
@@ -2353,6 +2417,12 @@ import { tags } from "@lezer/highlight";
   });
 
   document.addEventListener("keydown", async event => {
+    const tableCell = event.target.closest?.(".data-cell");
+    if (tableCell && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      moveTableCell(tableCell, event.key);
+      return;
+    }
     if (event.target.matches?.('[role="tab"][data-postgres-tab]') && ["ArrowLeft", "ArrowRight"].includes(event.key)) {
       event.preventDefault();
       const nextTab = event.target.dataset.postgresTab === "general" ? "security" : "general";
