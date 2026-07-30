@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Rowake",
+  "outputfilename": "Rowake",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "author": {
+    "name": "Rowake"
+  },
+  "info": {
+    "companyName": "Rowake",
+    "productName": "Rowake",
+    "productVersion": "0.1.0",
+    "copyright": "Copyright 2026 Rowake",
+    "comments": "Rowake desktop application"
+  }
+}

@@ -1,0 +1,10 @@
+.git
+.github
+.agents
+.impeccable
+bin
+dist
+desktop-wails
+testdata
+data
+*.log
