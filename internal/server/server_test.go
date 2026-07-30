@@ -29,6 +29,23 @@ func TestInterfaceAndSQLiteAPI(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "<title>Rowake</title>") {
 		t.Fatalf("interface response = %d %s", response.Code, response.Body.String())
 	}
+	csp := response.Header().Get("Content-Security-Policy")
+	nonceStart := strings.Index(csp, "'nonce-")
+	if nonceStart < 0 {
+		t.Fatalf("content security policy has no style nonce: %q", csp)
+	}
+	nonceStart += len("'nonce-")
+	nonceEnd := strings.Index(csp[nonceStart:], "'")
+	if nonceEnd < 0 {
+		t.Fatalf("content security policy has an invalid style nonce: %q", csp)
+	}
+	nonce := csp[nonceStart : nonceStart+nonceEnd]
+	if !strings.Contains(response.Body.String(), `name="csp-nonce" content="`+nonce+`"`) {
+		t.Fatalf("interface nonce does not match policy: %q", nonce)
+	}
+	if strings.Contains(response.Body.String(), "{{CSP_NONCE}}") {
+		t.Fatal("interface contains an unreplaced nonce marker")
+	}
 
 	response = serve(handler, http.MethodGet, "/api/v1/connections", nil)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"connections":[]`) {

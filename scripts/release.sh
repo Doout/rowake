@@ -54,7 +54,6 @@ do
     )
 
     cp "$ROOT/README.md" "$package/README.md"
-    cp "$ROOT/THIRD_PARTY_NOTICES.md" "$package/THIRD_PARTY_NOTICES.md"
     cp "$ROOT/docs/DRIVERS.md" "$package/docs/DRIVERS.md"
 
     if [ "$GOOS" = windows ]; then
