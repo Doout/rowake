@@ -51,6 +51,10 @@ func TestInterfaceAndSQLiteAPI(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"connections":[]`) {
 		t.Fatalf("connections response = %d %s", response.Code, response.Body.String())
 	}
+	response = serve(handler, http.MethodPost, "/api/v1/databases", strings.NewReader(`{}`))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "PostgreSQL") {
+		t.Fatalf("database discovery response = %d %s", response.Code, response.Body.String())
+	}
 
 	body, err := json.Marshal(app.ConnectionRequest{
 		Name:           "Fixture",

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/Doout/rowake/internal/app"
@@ -182,6 +183,49 @@ func TestConnectionPersistence(t *testing.T) {
 	}
 	if _, err := second.Catalog(ctx, connections[0].ID); err != nil {
 		t.Fatalf("restored connection catalog: %v", err)
+	}
+}
+
+func TestConnectionPersistenceDropsServerCredentials(t *testing.T) {
+	ctx := context.Background()
+	storePath := filepath.Join(t.TempDir(), "Rowake", "connections.json")
+	if err := os.MkdirAll(filepath.Dir(storePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(storePath, []byte(`{
+  "version": 1,
+  "connections": [{
+    "name": "Do not persist",
+    "engine": "postgres",
+    "host": "127.0.0.1",
+    "port": 5432,
+    "username": "postgres",
+    "password": "example-secret",
+    "database": "postgres"
+  }]
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	value := service.New("dev")
+	t.Cleanup(func() { _ = value.Close() })
+	if err := value.EnablePersistence(ctx, storePath); err == nil ||
+		!strings.Contains(err.Error(), "server credentials are session-only") {
+		t.Fatalf("persistence error = %v", err)
+	}
+	if _, err := value.AddConnection(ctx, app.ConnectionRequest{
+		Name:           "Saved fixture",
+		Engine:         "sqlite",
+		DataSourceName: fixturePath(t),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(stored), "example-secret") || strings.Contains(string(stored), "postgres") {
+		t.Fatalf("server connection remained in store: %s", stored)
 	}
 }
 

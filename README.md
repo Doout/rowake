@@ -1,6 +1,6 @@
 # Rowake
 
-Rowake is a relational database viewer for the browser and desktop. It currently opens SQLite database files in read-only mode.
+Rowake is a read-only relational database viewer for the browser and desktop. It supports SQLite database files and PostgreSQL servers.
 
 ## Run
 
@@ -23,7 +23,9 @@ make build
 ./bin/rowake serve --listen 0.0.0.0:8080
 ```
 
-Open **Connections**, add the path to an existing SQLite file, then browse its tables, filter or sort the loaded row preview, inspect its relationship topology, or run a read-only query. The Wails desktop app saves and restores connections. Browser and server modes keep them in memory until Rowake closes.
+Open **Connections** to choose a saved database. Adding one starts with a connection-string/type chooser, then opens a dedicated SQLite or PostgreSQL setup screen. PostgreSQL connections can load the databases available to the supplied account before you select one. Browse tables across schemas, filter or sort the loaded row preview, inspect relationship topology, or run a read-only query.
+
+The Wails desktop app saves and restores SQLite file connections. PostgreSQL credentials are never persisted by Rowake; PostgreSQL connections and all browser/server connections stay in memory until Rowake closes. Use a database account restricted to the intended databases and schemas.
 
 For Compose, place SQLite files in `./data`; they are available to Rowake under `/data`:
 
@@ -31,6 +33,8 @@ For Compose, place SQLite files in `./data`; they are available to Rowake under 
 mkdir -p data
 docker compose up --build
 ```
+
+When Rowake runs on the host, connect to a published PostgreSQL container through its host port, commonly `127.0.0.1:5432`. When Rowake and PostgreSQL share a Compose network, use the PostgreSQL service name as the host.
 
 ## Test database
 

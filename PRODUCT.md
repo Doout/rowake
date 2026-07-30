@@ -25,13 +25,14 @@ Success means a user can start Rowake, connect to a supported database, and insp
 
 ## Capabilities and Constraints
 
-- The current MVP opens local SQLite files in read-only mode and supports connection selection, catalog browsing, loaded-row search/filter/sort, table structure and index inspection, foreign-key topology, and bounded SQL query results.
+- The current MVP opens local SQLite files and PostgreSQL databases in read-only mode and supports connection selection, catalog browsing, loaded-row search/filter/sort, table structure and index inspection, foreign-key topology, and bounded SQL query results.
 - Rowake starts without fabricated connections or records.
-- The Wails desktop app persists local SQLite connection definitions on the device. Browser and server connections live only for the current process. PostgreSQL/MySQL catalog adapters are not implemented.
+- The Wails desktop app persists local SQLite connection definitions on the device. PostgreSQL credentials and browser/server connections live only for the current process.
+- PostgreSQL setup can enumerate databases the supplied account may connect to, then connect to the selected database and browse its non-system schemas.
 - Table previews, query results, connection pools, and statement execution must remain bounded.
 - Read-only database credentials are the primary safety boundary; application-level query guards are defense in depth.
 - Persisted connection credentials, schema mutation, arbitrary writes, multi-user authorization, saved queries, query-history persistence, imports, exports, data diffing, SSH tunnels, and cloud-specific authentication are outside the current scope.
-- PostgreSQL and MySQL/MariaDB drivers are bundled for future adapters, but only SQLite is available in the current connection flow.
+- The MySQL/MariaDB driver is bundled for a future adapter, but MySQL/MariaDB is not available in the current connection flow.
 - Row editing is planned after the read-only MVP. UI actions must remain capability-gated so write support can be introduced without changing the browsing model or implying access the active connection does not have.
 
 ## Brand Commitments

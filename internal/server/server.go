@@ -49,6 +49,7 @@ func New(service app.Service, logger *slog.Logger) (http.Handler, error) {
 	mux.HandleFunc("GET /api/v1/meta", s.meta)
 	mux.HandleFunc("GET /api/v1/connections", s.connections)
 	mux.HandleFunc("POST /api/v1/connections", s.addConnection)
+	mux.HandleFunc("POST /api/v1/databases", s.databases)
 	mux.HandleFunc("GET /api/v1/catalog", s.catalog)
 	mux.HandleFunc("GET /api/v1/topology", s.topology)
 	mux.HandleFunc("GET /api/v1/table", s.table)
@@ -126,6 +127,24 @@ func (s *Server) addConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusCreated, map[string]any{"connection": value})
+}
+
+func (s *Server) databases(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request app.ConnectionRequest
+	if err := decoder.Decode(&request); err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("decode database discovery request: %w", err))
+		return
+	}
+	value, err := s.service.Databases(r.Context(), request)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"databases": value})
 }
 
 func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
