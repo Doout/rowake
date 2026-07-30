@@ -13,6 +13,7 @@ import { Compartment, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags } from "@lezer/highlight";
+import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
 
 (() => {
   "use strict";
@@ -22,6 +23,13 @@ import { tags } from "@lezer/highlight";
   const cspNonce = document.querySelector('meta[name="csp-nonce"]')?.content || "";
   const queryLanguage = new Compartment();
   let queryEditorView = null;
+  let pendingValueFormats = [];
+  let valueFormatFrame = 0;
+  let valueFormatIdle = 0;
+  let valueFormatIdleKind = "";
+  let valueFormatGeneration = 0;
+  let valueFormatSerial = 0;
+  const valueFormatBudgetMS = 4;
   const columnCompletionSection = { name: "Columns", rank: 0 };
   const tableCompletionSection = { name: "Tables", rank: 1 };
   const keywordCompletionSection = { name: "Keywords", rank: 2 };
@@ -206,6 +214,96 @@ import { tags } from "@lezer/highlight";
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 
+  function cancelValueFormatting() {
+    valueFormatGeneration += 1;
+    if (valueFormatFrame) cancelAnimationFrame(valueFormatFrame);
+    if (valueFormatIdle) {
+      if (valueFormatIdleKind === "idle") window.cancelIdleCallback(valueFormatIdle);
+      else clearTimeout(valueFormatIdle);
+    }
+    valueFormatFrame = 0;
+    valueFormatIdle = 0;
+    valueFormatIdleKind = "";
+  }
+
+  function requestValueFormatChunk(callback) {
+    if ("requestIdleCallback" in window) {
+      valueFormatIdleKind = "idle";
+      valueFormatIdle = window.requestIdleCallback(callback, { timeout: 50 });
+      return;
+    }
+    valueFormatIdleKind = "timeout";
+    valueFormatIdle = window.setTimeout(callback, 0);
+  }
+
+  function valueFormatClass(formatted, includeRawState = true) {
+    const booleanState = formatted.kind === "boolean" ? ` ${formatted.display.toLowerCase()}` : "";
+    const rawState = includeRawState && formatted.changed ? " has-raw" : "";
+    return `formatted-value ${formatted.kind}-value${booleanState}${rawState}`;
+  }
+
+  function applyCellFormat(element, formatted) {
+    element.className = valueFormatClass(formatted);
+    element.textContent = formatted.display;
+    if (formatted.changed) {
+      element.title = `Raw value: ${formatted.raw}`;
+      element.setAttribute("aria-label", `${formatted.display}. Raw value: ${formatted.raw}`);
+    } else {
+      element.removeAttribute("title");
+      element.removeAttribute("aria-label");
+    }
+  }
+
+  function applyInspectorFormat(element, formatted) {
+    const display = formatted.kind === "json" && formatted.pretty
+      ? `<pre>${html(formatted.pretty)}</pre>`
+      : `<span class="${valueFormatClass(formatted, false)}">${html(formatted.display)}</span>`;
+    const raw = formatted.rawDiffers
+      ? `<details class="raw-value"><summary>Raw value</summary><code>${html(formatted.raw)}</code></details>`
+      : "";
+    element.className = "inspector-value";
+    element.innerHTML = `${display}${raw}`;
+  }
+
+  function queueValueFormat(value, column, mode) {
+    const raw = rawDatabaseValue(value);
+    const id = `value-format-${++valueFormatSerial}`;
+    pendingValueFormats.push({ id, value, column, raw, mode });
+    return { id, raw };
+  }
+
+  function scheduleValueFormatting(jobs) {
+    cancelValueFormatting();
+    if (!jobs.length) return;
+    const generation = valueFormatGeneration;
+    let cursor = 0;
+    const formatChunk = () => {
+      valueFormatIdle = 0;
+      valueFormatIdleKind = "";
+      if (generation !== valueFormatGeneration) return;
+      const started = performance.now();
+      do {
+        const job = jobs[cursor++];
+        const element = document.getElementById(job.id);
+        if (element) {
+          try {
+            const formatted = formatDatabaseValue(job.value, job.column, { raw: job.raw });
+            if (job.mode === "inspector") applyInspectorFormat(element, formatted);
+            else applyCellFormat(element, formatted);
+          } catch (_) {
+            element.classList.remove("value-format-pending");
+          }
+          element.removeAttribute("id");
+        }
+      } while (cursor < jobs.length && performance.now() - started < valueFormatBudgetMS);
+      if (cursor < jobs.length) requestValueFormatChunk(formatChunk);
+    };
+    valueFormatFrame = requestAnimationFrame(() => {
+      valueFormatFrame = 0;
+      if (generation === valueFormatGeneration) requestValueFormatChunk(formatChunk);
+    });
+  }
+
   async function api(path, options = {}) {
     const headers = new Headers(options.headers || {});
     if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -271,6 +369,8 @@ import { tags } from "@lezer/highlight";
       queryEditorView.destroy();
       queryEditorView = null;
     }
+    const valueFormats = pendingValueFormats;
+    pendingValueFormats = [];
     const connection = currentConnection();
     const version = state.meta?.version ? `v${state.meta.version.replace(/-.*/, "")}` : "";
     app.className = `shell ${state.sidebarCollapsed ? "sidebar-collapsed" : ""} ${options.workspace ? "workspace-shell" : ""}`.trim();
@@ -305,9 +405,12 @@ import { tags } from "@lezer/highlight";
         </div>
       </aside>
       <main class="main">${content}</main>`;
+    scheduleValueFormatting(valueFormats);
   }
 
   function launchShell(content) {
+    pendingValueFormats = [];
+    cancelValueFormatting();
     const connection = currentConnection();
     const version = state.meta?.version ? `v${state.meta.version.replace(/-.*/, "")}` : "";
     app.className = "connection-launch";
@@ -786,12 +889,9 @@ import { tags } from "@lezer/highlight";
   }
 
   function formatCell(value, column = {}) {
-    if (value === null || value === undefined) return `<span class="null-value">NULL</span>`;
-    if (typeof value === "boolean") return `<span class="boolean-value ${value ? "true" : "false"}">${value ? "true" : "false"}</span>`;
-    const text = String(value);
-    if (/json/i.test(column.data_type || "") || ((text.startsWith("{") || text.startsWith("[")) && text.length > 2)) return `<span class="json-value" title="${html(text)}">${html(text)}</span>`;
-    if (/int|decimal|numeric|real|double|float/i.test(column.data_type || "") && typeof value === "number") return `<span class="numeric-value">${html(value)}</span>`;
-    return `<span title="${html(text)}">${html(text)}</span>`;
+    const pending = queueValueFormat(value, column, "cell");
+    const nullState = value === null || value === undefined ? " null-value" : "";
+    return `<span id="${pending.id}" class="formatted-value value-format-pending${nullState}">${html(pending.raw)}</span>`;
   }
 
   function renderStructure(snapshot) {
@@ -846,21 +946,16 @@ import { tags } from "@lezer/highlight";
       <dl class="row-fields">
         ${snapshot.columns.map((column, index) => `<div class="row-field">
           <dt><span>${html(column.name)}</span><small>${html(column.data_type)}</small></dt>
-          <dd>${inspectorValue(row[index])}</dd>
+          <dd>${inspectorValue(row[index], column)}</dd>
         </div>`).join("")}
       </dl>
       <footer class="inspector-foot"><span class="lock-mark">⌑</span><span>Read-only</span></footer>
     </aside>`;
   }
 
-  function inspectorValue(value) {
-    if (value === null || value === undefined) return `<span class="null-value">NULL</span>`;
-    if (typeof value === "boolean") return `<code>${value}</code>`;
-    const text = String(value);
-    if (text.startsWith("{") || text.startsWith("[")) {
-      try { return `<pre>${html(JSON.stringify(JSON.parse(text), null, 2))}</pre>`; } catch (_) {}
-    }
-    return `<span>${html(text)}</span>`;
+  function inspectorValue(value, column = {}) {
+    const pending = queueValueFormat(value, column, "inspector");
+    return `<div id="${pending.id}" class="inspector-value value-format-pending"><span>${html(pending.raw)}</span></div>`;
   }
 
   async function loadTopology(force = false) {

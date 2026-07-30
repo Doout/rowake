@@ -352,11 +352,16 @@ select { appearance: none; padding-right: 30px; background-image: linear-gradien
 .result-grid td.row-number { position: sticky; left: 0; z-index: 2; min-width: 42px; width: 42px; padding: 0; color: #65717d; text-align: center; font-size: 8px; }
 .result-grid .selectable-row { cursor: pointer; }
 .result-grid .grid-empty { height: 120px; color: var(--muted); text-align: center; font-family: inherit; }
+.formatted-value { max-width: 100%; }
+.formatted-value.has-raw { border-bottom: 1px dotted #586777; cursor: help; }
 .numeric-value { color: #b9d3f8; }
 .null-value { color: #697582; font-size: 8px; font-style: italic; }
 .boolean-value { color: #d3bc86; }
 .boolean-value.true { color: #9ed8ba; }
 .json-value { color: #c4acd9; }
+.date-value, .datetime-value, .time-value { color: #a8d6be; }
+.uuid-value { color: #c8d4e5; }
+.binary-value { color: #dfc483; }
 .result-status { min-height: 31px; padding: 0 11px 0 13px; border-top: 1px solid var(--border); background: #101419; color: var(--subtle); display: flex; align-items: center; justify-content: space-between; gap: 18px; font-size: 9px; font-variant-numeric: tabular-nums; }
 .result-status > div { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
 .result-status strong { color: #d6dde4; font-weight: 630; }
@@ -380,6 +385,12 @@ select { appearance: none; padding-right: 30px; background-image: linear-gradien
 .row-field dt small { color: #697582; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 7px; text-transform: uppercase; }
 .row-field dd { min-width: 0; margin: 0; color: #bfc8d1; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; line-height: 1.45; }
 .row-field pre { max-height: 180px; margin: 0; padding: 9px; border: 1px solid var(--border); border-radius: 5px; background: #0c1014; color: #c4acd9; overflow: auto; white-space: pre-wrap; }
+.inspector-value { min-width: 0; display: grid; gap: 8px; }
+.raw-value { min-width: 0; color: #788491; }
+.raw-value summary { width: max-content; cursor: pointer; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 8px; user-select: none; }
+.raw-value summary:hover { color: #b9c3cd; }
+.raw-value summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.raw-value code { max-height: 128px; margin-top: 6px; padding: 7px 8px; border: 1px solid #29323d; border-radius: 5px; background: #0c1014; color: #aeb9c4; display: block; overflow: auto; white-space: pre-wrap; word-break: break-word; }
 .inspector-foot { min-height: 38px; padding: 0 12px; border-top: 1px solid var(--border); background: #101419; color: var(--subtle); display: flex; align-items: center; gap: 8px; font-size: 9px; }
 .lock-mark { color: var(--accent); font-size: 13px; }
 
