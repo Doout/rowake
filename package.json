@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "build:web": "esbuild webembed/src/app.js --bundle --format=iife --platform=browser --target=es2022 --minify-whitespace --legal-comments=eof --outfile=webembed/dist/app.js",
-    "check:web": "npm run build:web -- --log-level=warning && node --check webembed/dist/app.js"
+    "check:web": "npm run build:web -- --log-level=warning && node --check webembed/dist/app.js",
+    "test:web": "node --test webembed/src/*.test.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",
