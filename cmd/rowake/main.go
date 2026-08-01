@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -61,17 +63,22 @@ func runServer(args []string, defaultListen string, defaultOpen bool) error {
 	flags.SetOutput(os.Stderr)
 	listen := flags.String("listen", defaultListen, "HTTP listen address")
 	open := flags.Bool("open", defaultOpen, "open Rowake in the default browser")
+	accessToken := flags.String("access-token", os.Getenv("ROWAKE_ACCESS_TOKEN"), "access token required by non-loopback server mode")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if requiresAccessToken(*listen) && strings.TrimSpace(*accessToken) == "" {
+		return errors.New("non-loopback server mode requires --access-token or ROWAKE_ACCESS_TOKEN")
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	running, err := launch.Start(ctx, launch.Config{
-		Listen:  *listen,
-		Version: version,
-		Logger:  logger,
+		Listen:      *listen,
+		Version:     version,
+		Logger:      logger,
+		AccessToken: strings.TrimSpace(*accessToken),
 	})
 	if err != nil {
 		return err
@@ -94,6 +101,15 @@ func runServer(args []string, defaultListen string, defaultOpen bool) error {
 		defer cancel()
 		return running.Shutdown(shutdownCtx)
 	}
+}
+
+func requiresAccessToken(listen string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(listen))
+	if err != nil {
+		return true
+	}
+	host = strings.Trim(host, "[]")
+	return host != "127.0.0.1" && host != "::1" && !strings.EqualFold(host, "localhost")
 }
 
 func openBrowser(url string) error {
@@ -123,7 +139,7 @@ func printUsage() {
 
 Usage:
   rowake open    [--listen 127.0.0.1:8080]
-  rowake serve   [--listen 0.0.0.0:8080] [--open]
+  rowake serve   [--listen 0.0.0.0:8080] [--access-token TOKEN] [--open]
   rowake drivers
   rowake version
 

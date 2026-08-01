@@ -17,6 +17,9 @@ func (s *Service) Catalog(ctx context.Context, connectionID string) (app.Catalog
 	if err != nil {
 		return app.Catalog{}, err
 	}
+	if connection.database == nil {
+		return app.Catalog{}, errors.New("database connection is disconnected")
+	}
 	if connection.info.Engine == "postgres" {
 		return postgresCatalog(ctx, connection.database, connectionID)
 	}
@@ -57,6 +60,9 @@ func (s *Service) Topology(ctx context.Context, connectionID string) (app.Databa
 	if err != nil {
 		return app.DatabaseTopology{}, err
 	}
+	if connection.database == nil {
+		return app.DatabaseTopology{}, errors.New("database connection is disconnected")
+	}
 	if connection.info.Engine == "postgres" {
 		return postgresTopology(ctx, connection.database, connectionID)
 	}
@@ -75,12 +81,17 @@ func (s *Service) Topology(ctx context.Context, connectionID string) (app.Databa
 			if err != nil {
 				return app.DatabaseTopology{}, err
 			}
+			indexes, err := sqliteIndexes(ctx, connection.database, table.Name)
+			if err != nil {
+				return app.DatabaseTopology{}, err
+			}
 			topology.Tables = append(topology.Tables, app.TopologyTable{
 				ID:         fmt.Sprintf("table-%d", len(topology.Tables)),
 				Schema:     schema.Name,
 				Name:       table.Name,
 				Kind:       table.Kind,
 				Columns:    columns,
+				Indexes:    indexes,
 				PrimaryKey: primaryKey,
 			})
 			relationships, err := sqliteRelationships(ctx, connection.database, table.Name)
@@ -94,58 +105,12 @@ func (s *Service) Topology(ctx context.Context, connectionID string) (app.Databa
 }
 
 func (s *Service) Table(ctx context.Context, connectionID, schema, table string, limit int) (app.TableSnapshot, error) {
-	connection, err := s.connection(connectionID)
-	if err != nil {
-		return app.TableSnapshot{}, err
-	}
-	if connection.info.Engine == "postgres" {
-		return postgresTable(ctx, connection.database, connectionID, schema, table, limit)
-	}
-	if schema != "main" {
-		return app.TableSnapshot{}, errors.New("SQLite table must use the main schema")
-	}
-	if err := verifySQLiteTable(ctx, connection.database, table); err != nil {
-		return app.TableSnapshot{}, err
-	}
-	limit = normalizeLimit(limit)
-	started := time.Now()
-
-	columns, primaryKey, err := sqliteColumns(ctx, connection.database, table)
-	if err != nil {
-		return app.TableSnapshot{}, err
-	}
-	indexes, err := sqliteIndexes(ctx, connection.database, table)
-	if err != nil {
-		return app.TableSnapshot{}, err
-	}
-
-	var totalRows int64
-	if err := connection.database.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+qualifiedName(schema, table)).Scan(&totalRows); err != nil {
-		return app.TableSnapshot{}, fmt.Errorf("count table rows: %w", err)
-	}
-	rows, err := connection.database.QueryContext(ctx, "SELECT * FROM "+qualifiedName(schema, table)+" LIMIT ?", limit)
-	if err != nil {
-		return app.TableSnapshot{}, fmt.Errorf("read table rows: %w", err)
-	}
-	values, err := readRows(rows, limit)
-	if err != nil {
-		return app.TableSnapshot{}, err
-	}
-
-	return app.TableSnapshot{
+	return s.TablePage(ctx, app.TablePageRequest{
 		ConnectionID: connectionID,
 		Schema:       schema,
-		Name:         table,
-		Columns:      columns,
-		Indexes:      indexes,
-		Rows:         values,
-		RowCount:     len(values),
-		TotalRows:    totalRows,
-		Truncated:    totalRows > int64(len(values)),
-		DurationMS:   durationMilliseconds(time.Since(started)),
-		PrimaryKey:   primaryKey,
-		Capabilities: app.Capability{CanQuery: true, CanWrite: false, CanEdit: false},
-	}, nil
+		Table:        table,
+		Limit:        limit,
+	})
 }
 
 func (s *Service) Query(ctx context.Context, request app.QueryRequest) (app.QueryResult, error) {
@@ -157,7 +122,10 @@ func (s *Service) Query(ctx context.Context, request app.QueryRequest) (app.Quer
 	if err != nil {
 		return app.QueryResult{}, err
 	}
-	queryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	if connection.database == nil {
+		return app.QueryResult{}, errors.New("database connection is disconnected")
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, boundedTimeout(request.TimeoutSeconds))
 	defer cancel()
 	started := time.Now()
 
@@ -211,6 +179,7 @@ func (s *Service) Query(ctx context.Context, request app.QueryRequest) (app.Quer
 		DurationMS: durationMilliseconds(time.Since(started)),
 		Truncated:  truncated,
 		Statement:  statement,
+		CapturedAt: time.Now().UTC(),
 	}, nil
 }
 
@@ -378,13 +347,16 @@ func sqliteRelationships(ctx context.Context, database *sql.DB, table string) ([
 			return nil, fmt.Errorf("scan table relationship: %w", err)
 		}
 		relationships = append(relationships, app.TopologyRelationship{
-			ID:         fmt.Sprintf("%s-fk-%d-%d", table, foreignKeyID, sequence),
-			FromTable:  table,
-			FromColumn: fromColumn.String,
-			ToTable:    targetTable,
-			ToColumn:   toColumn.String,
-			OnUpdate:   onUpdate,
-			OnDelete:   onDelete,
+			ID:           fmt.Sprintf("%s-fk-%d-%d", table, foreignKeyID, sequence),
+			ConstraintID: fmt.Sprintf("%s-fk-%d", table, foreignKeyID),
+			FromSchema:   "main",
+			FromTable:    table,
+			FromColumn:   fromColumn.String,
+			ToSchema:     "main",
+			ToTable:      targetTable,
+			ToColumn:     toColumn.String,
+			OnUpdate:     onUpdate,
+			OnDelete:     onDelete,
 		})
 	}
 	if err := rows.Err(); err != nil {

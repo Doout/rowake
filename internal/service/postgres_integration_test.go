@@ -110,6 +110,9 @@ func TestPostgresConnectionWorkflow(t *testing.T) {
 			relationship.FromTable == "members" &&
 			relationship.ToSchema == schema &&
 			relationship.ToTable == "teams" {
+			if relationship.ConstraintID == "" {
+				t.Fatal("PostgreSQL relationship is missing its constraint identity")
+			}
 			foundRelationship = true
 		}
 	}
@@ -120,9 +123,30 @@ func TestPostgresConnectionWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if table.TotalRows != 1 || table.RowCount != 1 || len(table.PrimaryKey) != 1 ||
+	if table.TotalRows != nil || table.RowCount != 1 || len(table.PrimaryKey) != 1 ||
 		table.PrimaryKey[0] != "id" || len(table.Indexes) == 0 {
 		t.Fatalf("table = %#v", table)
+	}
+	filtered, err := value.TablePage(ctx, app.TablePageRequest{
+		ConnectionID: connection.ID,
+		Schema:       schema,
+		Table:        "members",
+		Limit:        10,
+		Filters:      []app.TableFilter{{Column: "email", Operator: "contains", Value: "dev@"}},
+		Sort:         &app.TableSort{Column: "email", Direction: "desc"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filtered.RowCount != 1 || filtered.Rows[0][2] != "dev@example.test" {
+		t.Fatalf("filtered PostgreSQL page = %#v", filtered)
+	}
+	plan, err := value.Explain(ctx, app.QueryRequest{ConnectionID: connection.ID, SQL: "SELECT * FROM " + quotedSchema + ".members WHERE id = 1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Engine != "postgres" || len(plan.Nodes) != 1 || plan.Nodes[0].Operation == "" {
+		t.Fatalf("PostgreSQL explain plan = %#v", plan)
 	}
 	result, err := value.Query(ctx, app.QueryRequest{
 		ConnectionID: connection.ID,
