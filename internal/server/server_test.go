@@ -95,6 +95,20 @@ func TestInterfaceAndSQLiteAPI(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "alice@example.test") {
 		t.Fatalf("table response = %d %s", response.Code, response.Body.String())
 	}
+	pageBody, err := json.Marshal(app.TablePageRequest{
+		ConnectionID: added.Connection.ID,
+		Schema:       "main",
+		Table:        "users",
+		Limit:        2,
+		Filters:      []app.TableFilter{{Column: "email", Operator: "contains", Value: "alice"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = serve(handler, http.MethodPost, "/api/v1/table/page", bytes.NewReader(pageBody))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"row_count":1`) {
+		t.Fatalf("table page response = %d %s", response.Code, response.Body.String())
+	}
 
 	body, err = json.Marshal(app.QueryRequest{
 		ConnectionID: added.Connection.ID,
@@ -119,6 +133,65 @@ func TestInterfaceAndSQLiteAPI(t *testing.T) {
 	response = serve(handler, http.MethodPost, "/api/v1/query", bytes.NewReader(body))
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "read-only") {
 		t.Fatalf("write query response = %d %s", response.Code, response.Body.String())
+	}
+
+	body, err = json.Marshal(app.QueryRequest{ConnectionID: added.Connection.ID, SQL: "SELECT * FROM users WHERE id = 1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = serve(handler, http.MethodPost, "/api/v1/explain", bytes.NewReader(body))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"engine":"sqlite"`) {
+		t.Fatalf("explain response = %d %s", response.Code, response.Body.String())
+	}
+	response = serve(handler, http.MethodGet, "/api/v1/schema-snapshot?"+url.Values{"connection_id": {added.Connection.ID}}.Encode(), nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"version":1`) {
+		t.Fatalf("schema snapshot response = %d %s", response.Code, response.Body.String())
+	}
+	response = serve(handler, http.MethodGet, "/api/v1/connections/"+added.Connection.ID+"/profile", nil)
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), `"password":`) {
+		t.Fatalf("connection profile response = %d %s", response.Code, response.Body.String())
+	}
+	response = serve(handler, http.MethodPost, "/api/v1/connections/"+added.Connection.ID+"/disconnect", nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"disconnected"`) {
+		t.Fatalf("disconnect response = %d %s", response.Code, response.Body.String())
+	}
+	response = serve(handler, http.MethodPost, "/api/v1/connections/"+added.Connection.ID+"/reconnect", strings.NewReader(`{}`))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"connected"`) {
+		t.Fatalf("reconnect response = %d %s", response.Code, response.Body.String())
+	}
+	response = serve(handler, http.MethodDelete, "/api/v1/connections/"+added.Connection.ID, nil)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("remove response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAccessTokenBoundary(t *testing.T) {
+	appService := service.New("dev")
+	t.Cleanup(func() { _ = appService.Close() })
+	handler, err := server.NewWithAccessToken(appService, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := serve(handler, http.MethodGet, "/healthz", nil); response.Code != http.StatusOK {
+		t.Fatalf("health response = %d", response.Code)
+	}
+	if response := serve(handler, http.MethodGet, "/api/v1/meta", nil); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized API response = %d %s", response.Code, response.Body.String())
+	}
+	response := serve(handler, http.MethodGet, "/?token=test-access-token&next=1", nil)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/?next=1" {
+		t.Fatalf("token bootstrap response = %d, location %q", response.Code, response.Header().Get("Location"))
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("access cookie = %#v", cookies)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/meta", nil)
+	request.AddCookie(cookies[0])
+	authorized := httptest.NewRecorder()
+	handler.ServeHTTP(authorized, request)
+	if authorized.Code != http.StatusOK {
+		t.Fatalf("authorized API response = %d %s", authorized.Code, authorized.Body.String())
 	}
 }
 

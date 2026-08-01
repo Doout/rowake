@@ -18,15 +18,19 @@ The browser interface uses CodeMirror's SQL package for dialect-aware editing an
 
 ## Service boundary
 
-`internal/app.Service` defines database discovery, connection creation, catalogs, database topology, table snapshots, and query results. `internal/service` keeps live connections in memory and implements read-only SQLite and PostgreSQL catalog, foreign-key introspection, table, index, and query operations.
+`internal/app.Service` defines database discovery, connection lifecycle, catalogs, database topology, paged table reads, query results, explain plans, and schema snapshots. `internal/service` keeps live pools in memory and implements the read-only SQLite and PostgreSQL adapters.
 
-The Wails shell supplies a user-configuration path to `internal/launch`. SQLite connection definitions are written atomically with user-only file permissions and restored when the desktop app starts. PostgreSQL credentials are never written to that store. Browser and server launches do not supply a store and remain session-only.
+The Wails shell supplies a user-configuration path to `internal/launch`. SQLite definitions and non-secret PostgreSQL profile fields are written atomically with user-only file permissions and restored when the desktop app starts. Plaintext passwords and credential-bearing DSNs are stripped during migration. PostgreSQL profiles may refer to an environment variable, macOS Keychain item, or Linux Secret Service item. Browser and server launches do not supply a connection store and remain session-only.
 
-SQLite files are opened with `mode=ro`, one pooled connection, bounded row limits, and a query timeout. The statement guard accepts only a single read-oriented statement.
+SQLite files are opened with `mode=ro`, one pooled connection, bounded row/byte limits, and a configurable timeout capped at 15 seconds. The statement guard accepts only a single read-oriented statement.
 
 PostgreSQL accepts structured host, port, username, password, database, and SSL-mode settings or a DSN through the API. Before a connection is added, the service can query `pg_database` for databases the account may connect to. Connected pools force `default_transaction_read_only=on`, run user SQL in an explicit read-only transaction, set a statement timeout, hide credentials from connection responses, and expose only non-system schemas.
 
-`GET /api/v1/topology` returns real tables, columns, primary keys, and foreign-key relationships for the selected connection. The browser lays those facts out as an interactive three-column schema map. Search, filters, and sorting in the data browser operate on the bounded table snapshot; they do not issue unbounded queries.
+`POST /api/v1/table/page` validates identifiers against live metadata, binds every filter value, applies stable ordering, avoids exact counts, and returns opaque previous/next cursors plus capture and truncation metadata. `GET /api/v1/topology` returns tables, columns, indexes, primary keys, and grouped foreign-key constraints. Related-record navigation converts those constraints into bounded parameterized page requests.
+
+The browser stores a versioned investigation workspace in local storage: named query tabs, unsaved SQL, connection-scoped history, saved queries, recent/pinned objects, schema snapshots, and bounded row/time preferences. It never stores connection requests or passwords.
+
+Explain is opt-in. SQLite uses `EXPLAIN QUERY PLAN`; PostgreSQL uses JSON `EXPLAIN` with `ANALYZE FALSE` inside a read-only transaction. Schema snapshots contain topology only, never row data or credentials, and are diffed client-side into deterministic JSON or Markdown.
 
 ## Build invariant
 
@@ -43,12 +47,14 @@ Tests, driver checks, container checks, and release builds enforce this set.
 ## Current limits
 
 - No persistence in browser or server mode.
-- Desktop persistence stores SQLite names and local file paths only.
+- Desktop persistence stores non-secret connection profiles; password material must be supplied directly for the process or resolved through a named secret reference.
 - No MySQL/MariaDB catalog adapter.
 - No row or schema mutation in the current implementation. Table capabilities keep that boundary explicit for planned row editing.
-- No multi-user authentication.
+- Server mode provides a shared access-token boundary, not user accounts or per-user authorization.
 
 Read-only database credentials remain the primary safety boundary.
+
+See [Security](SECURITY.md) for the deployment threat model.
 
 ## Test fixture
 

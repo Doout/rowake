@@ -20,6 +20,7 @@ var ErrConnectionRequired = errors.New("no database connection is configured")
 
 type connectionState struct {
 	info     app.Connection
+	request  app.ConnectionRequest
 	database *sql.DB
 	identity string
 	cleanup  func()
@@ -80,7 +81,7 @@ func (s *Service) addConnection(ctx context.Context, request app.ConnectionReque
 	case "sqlite":
 		return s.addSQLiteConnection(ctx, request, save)
 	case "postgres", "postgresql":
-		return s.addPostgresConnection(ctx, request)
+		return s.addPostgresConnection(ctx, request, save)
 	default:
 		return app.Connection{}, errors.New("database engine must be SQLite or PostgreSQL")
 	}
@@ -154,7 +155,10 @@ func (s *Service) addSQLiteConnection(ctx context.Context, request app.Connectio
 		s.saved = saved
 	}
 	s.connections[connection.ID] = &connectionState{
-		info:     connection,
+		info: connection,
+		request: app.ConnectionRequest{
+			Name: name, Engine: "sqlite", DataSourceName: path,
+		},
 		database: database,
 		identity: path,
 	}
@@ -167,10 +171,12 @@ func (s *Service) Close() error {
 	defer s.mu.Unlock()
 	var closeError error
 	for _, state := range s.connections {
-		if state.cleanup != nil {
-			state.cleanup()
-		} else if err := state.database.Close(); err != nil {
-			closeError = errors.Join(closeError, err)
+		if state.database != nil {
+			if state.cleanup != nil {
+				state.cleanup()
+			} else if err := state.database.Close(); err != nil {
+				closeError = errors.Join(closeError, err)
+			}
 		}
 	}
 	s.connections = make(map[string]*connectionState)

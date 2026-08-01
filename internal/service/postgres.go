@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -63,7 +66,7 @@ func (s *Service) Databases(ctx context.Context, request app.ConnectionRequest) 
 	return databases, nil
 }
 
-func (s *Service) addPostgresConnection(ctx context.Context, request app.ConnectionRequest) (app.Connection, error) {
+func (s *Service) addPostgresConnection(ctx context.Context, request app.ConnectionRequest, save bool) (app.Connection, error) {
 	if strings.TrimSpace(request.DataSourceName) == "" && strings.TrimSpace(request.Database) == "" {
 		return app.Connection{}, errors.New("PostgreSQL database is required")
 	}
@@ -87,7 +90,7 @@ func (s *Service) addPostgresConnection(ctx context.Context, request app.Connect
 
 	database, cleanup, err := openPostgres(ctx, config)
 	if err != nil {
-		return app.Connection{}, err
+		return app.Connection{}, sanitizeConnectionError(err, request)
 	}
 	name := strings.TrimSpace(request.Name)
 	if name == "" {
@@ -113,8 +116,18 @@ func (s *Service) addPostgresConnection(ctx context.Context, request app.Connect
 		Status:   "connected",
 		ReadOnly: true,
 	}
+	profile := postgresProfileFromConfig(request, name, config)
+	if save && s.storePath != "" {
+		saved := upsertSavedConnection(s.saved, persistentConnectionRequest(profile))
+		if err := writeConnectionStore(s.storePath, saved); err != nil {
+			cleanup()
+			return app.Connection{}, fmt.Errorf("save connection profile: %w", err)
+		}
+		s.saved = saved
+	}
 	s.connections[connection.ID] = &connectionState{
 		info:     connection,
+		request:  profile,
 		database: database,
 		identity: identity,
 		cleanup:  cleanup,
@@ -132,6 +145,13 @@ func postgresConfig(request app.ConnectionRequest, databaseOverride string) (*pg
 		config, err = pgx.ParseConfig(source)
 		if err != nil {
 			return nil, fmt.Errorf("parse PostgreSQL connection: %w", err)
+		}
+		if request.Password != "" || request.PasswordEnv != "" || request.SecretService != "" || request.SecretAccount != "" {
+			password, passwordErr := resolvePostgresPassword(request)
+			if passwordErr != nil {
+				return nil, passwordErr
+			}
+			config.Password = password
 		}
 	} else {
 		host := strings.TrimSpace(request.Host)
@@ -160,9 +180,13 @@ func postgresConfig(request app.ConnectionRequest, databaseOverride string) (*pg
 		if strings.TrimSpace(databaseOverride) != "" {
 			databaseName = strings.TrimSpace(databaseOverride)
 		}
+		password, passwordErr := resolvePostgresPassword(request)
+		if passwordErr != nil {
+			return nil, passwordErr
+		}
 		endpoint := &url.URL{
 			Scheme: "postgres",
-			User:   url.UserPassword(username, request.Password),
+			User:   url.UserPassword(username, password),
 			Host:   net.JoinHostPort(host, strconv.Itoa(port)),
 			Path:   "/" + databaseName,
 		}
@@ -185,6 +209,67 @@ func postgresConfig(request app.ConnectionRequest, databaseOverride string) (*pg
 	config.RuntimeParams["statement_timeout"] = strconv.FormatInt(postgresStatementTimeout.Milliseconds(), 10)
 	config.ConnectTimeout = 5 * time.Second
 	return config, nil
+}
+
+func postgresProfileFromConfig(request app.ConnectionRequest, name string, config *pgx.ConnConfig) app.ConnectionRequest {
+	sslMode := strings.ToLower(strings.TrimSpace(request.SSLMode))
+	if sslMode == "" {
+		sslMode = "prefer"
+	}
+	return app.ConnectionRequest{
+		Name:          name,
+		Engine:        "postgres",
+		Host:          config.Host,
+		Port:          int(config.Port),
+		Username:      config.User,
+		Password:      config.Password,
+		PasswordEnv:   strings.TrimSpace(request.PasswordEnv),
+		SecretService: strings.TrimSpace(request.SecretService),
+		SecretAccount: strings.TrimSpace(request.SecretAccount),
+		Database:      config.Database,
+		SSLMode:       sslMode,
+	}
+}
+
+func resolvePostgresPassword(request app.ConnectionRequest) (string, error) {
+	if request.Password != "" {
+		return request.Password, nil
+	}
+	if name := strings.TrimSpace(request.PasswordEnv); name != "" {
+		password, ok := os.LookupEnv(name)
+		if !ok {
+			return "", fmt.Errorf("password environment variable %s is not set", name)
+		}
+		return password, nil
+	}
+	serviceName := strings.TrimSpace(request.SecretService)
+	account := strings.TrimSpace(request.SecretAccount)
+	if serviceName == "" && account == "" {
+		return "", nil
+	}
+	if serviceName == "" || account == "" {
+		return "", errors.New("OS secret service and account are both required")
+	}
+	secretCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var command *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		command = exec.CommandContext(secretCtx, "security", "find-generic-password", "-s", serviceName, "-a", account, "-w")
+	case "linux":
+		command = exec.CommandContext(secretCtx, "secret-tool", "lookup", "service", serviceName, "account", account)
+	default:
+		return "", fmt.Errorf("OS secret references are not supported on %s", runtime.GOOS)
+	}
+	output, err := command.Output()
+	if err != nil {
+		return "", errors.New("read password from the OS secret store")
+	}
+	password := strings.TrimSpace(string(output))
+	if password == "" {
+		return "", errors.New("OS secret store returned an empty password")
+	}
+	return password, nil
 }
 
 func discoveryDatabase(request app.ConnectionRequest) string {
@@ -310,12 +395,17 @@ func postgresTopology(ctx context.Context, database *sql.DB, connectionID string
 			if err != nil {
 				return app.DatabaseTopology{}, err
 			}
+			indexes, err := postgresIndexes(ctx, database, schema.Name, table.Name)
+			if err != nil {
+				return app.DatabaseTopology{}, err
+			}
 			topology.Tables = append(topology.Tables, app.TopologyTable{
 				ID:         fmt.Sprintf("table-%d", len(topology.Tables)),
 				Schema:     schema.Name,
 				Name:       table.Name,
 				Kind:       table.Kind,
 				Columns:    columns,
+				Indexes:    indexes,
 				PrimaryKey: primaryKey,
 			})
 			relationships, err := postgresRelationships(ctx, database, schema.Name, table.Name)
@@ -326,56 +416,6 @@ func postgresTopology(ctx context.Context, database *sql.DB, connectionID string
 		}
 	}
 	return topology, nil
-}
-
-func postgresTable(
-	ctx context.Context,
-	database *sql.DB,
-	connectionID, schema, table string,
-	limit int,
-) (app.TableSnapshot, error) {
-	if strings.TrimSpace(schema) == "" {
-		return app.TableSnapshot{}, errors.New("PostgreSQL schema is required")
-	}
-	if err := verifyPostgresTable(ctx, database, schema, table); err != nil {
-		return app.TableSnapshot{}, err
-	}
-	limit = normalizeLimit(limit)
-	started := time.Now()
-	columns, primaryKey, err := postgresColumns(ctx, database, schema, table)
-	if err != nil {
-		return app.TableSnapshot{}, err
-	}
-	indexes, err := postgresIndexes(ctx, database, schema, table)
-	if err != nil {
-		return app.TableSnapshot{}, err
-	}
-	var totalRows int64
-	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+qualifiedName(schema, table)).Scan(&totalRows); err != nil {
-		return app.TableSnapshot{}, fmt.Errorf("count PostgreSQL table rows: %w", err)
-	}
-	rows, err := database.QueryContext(ctx, "SELECT * FROM "+qualifiedName(schema, table)+" LIMIT $1", limit)
-	if err != nil {
-		return app.TableSnapshot{}, fmt.Errorf("read PostgreSQL table rows: %w", err)
-	}
-	values, err := readRows(rows, limit)
-	if err != nil {
-		return app.TableSnapshot{}, err
-	}
-	return app.TableSnapshot{
-		ConnectionID: connectionID,
-		Schema:       schema,
-		Name:         table,
-		Columns:      columns,
-		Indexes:      indexes,
-		Rows:         values,
-		RowCount:     len(values),
-		TotalRows:    totalRows,
-		Truncated:    totalRows > int64(len(values)),
-		DurationMS:   durationMilliseconds(time.Since(started)),
-		PrimaryKey:   primaryKey,
-		Capabilities: app.Capability{CanQuery: true, CanWrite: false, CanEdit: false},
-	}, nil
 }
 
 func verifyPostgresTable(ctx context.Context, database *sql.DB, schema, table string) error {
@@ -600,6 +640,7 @@ func postgresRelationships(
 			return nil, fmt.Errorf("scan PostgreSQL relationship: %w", err)
 		}
 		relationship.ID = fmt.Sprintf("%s.%s-fk-%s-%d", schema, table, constraintID, ordinal)
+		relationship.ConstraintID = fmt.Sprintf("%s.%s-fk-%s", schema, table, constraintID)
 		relationships = append(relationships, relationship)
 	}
 	if err := rows.Err(); err != nil {

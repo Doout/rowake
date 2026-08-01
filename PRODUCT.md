@@ -25,13 +25,14 @@ Success means a user can start Rowake, connect to a supported database, and insp
 
 ## Capabilities and Constraints
 
-- The current MVP opens local SQLite files and PostgreSQL databases in read-only mode and supports connection selection, catalog browsing, loaded-row search/filter/sort, table structure and index inspection, foreign-key topology, and bounded SQL query results.
+- The current product opens local SQLite files and PostgreSQL databases in read-only mode and supports full-result server filtering/sorting, paged table inspection, relationship navigation, structure/index inspection, foreign-key topology, bounded SQL, safe explain plans, and schema snapshots/diffs.
 - Rowake starts without fabricated connections or records.
-- The Wails desktop app persists local SQLite connection definitions on the device. PostgreSQL credentials and browser/server connections live only for the current process.
+- The Wails desktop app persists SQLite definitions and non-secret PostgreSQL profiles. Passwords may remain process-only or be resolved from a named environment/OS secret; they are never written to the profile store.
 - PostgreSQL setup can enumerate databases the supplied account may connect to, then connect to the selected database and browse its non-system schemas.
 - Table previews, query results, connection pools, and statement execution must remain bounded.
 - Read-only database credentials are the primary safety boundary; application-level query guards are defense in depth.
-- Persisted connection credentials, schema mutation, arbitrary writes, multi-user authorization, saved queries, query-history persistence, imports, exports, data diffing, SSH tunnels, and cloud-specific authentication are outside the current scope.
+- Named query tabs, connection-scoped history, saved queries, recent/pinned objects, and schema snapshots persist locally as a versioned investigation workspace.
+- Schema mutation, arbitrary writes, multi-user authorization, imports, row exports, data diffing, SSH tunnels, and cloud-specific authentication remain outside the current scope.
 - The MySQL/MariaDB driver is bundled for a future adapter, but MySQL/MariaDB is not available in the current connection flow.
 - Row editing is planned after the read-only MVP. UI actions must remain capability-gated so write support can be introduced without changing the browsing model or implying access the active connection does not have.
 

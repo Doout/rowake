@@ -7,6 +7,8 @@ services:
         VERSION: dev
     ports:
       - "8080:8080"
+    environment:
+      ROWAKE_ACCESS_TOKEN: ${ROWAKE_ACCESS_TOKEN:-}
     volumes:
       - ./data:/data:ro
     read_only: true

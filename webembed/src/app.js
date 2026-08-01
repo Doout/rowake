@@ -14,6 +14,7 @@ import { EditorView, keymap } from "@codemirror/view";
 import { MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags } from "@lezer/highlight";
 import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
+import { normalizeWorkspace, WORKSPACE_VERSION } from "./workspace-state.mjs";
 
 (() => {
   "use strict";
@@ -24,6 +25,8 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
   const cspNonce = document.querySelector('meta[name="csp-nonce"]')?.content || "";
   const queryLanguage = new Compartment();
   let queryEditorView = null;
+  let workspacePersistTimer = 0;
+  let tableRequestController = null;
   let pendingValueFormats = [];
   let valueFormatFrame = 0;
   let valueFormatIdle = 0;
@@ -54,6 +57,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     tableSearch: "",
     tableFilters: [],
     tableSort: null,
+    tableCursor: "",
     dataControl: "",
     filterSerial: 0,
     catalogSearch: "",
@@ -72,6 +76,19 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     queryResult: null,
     queryError: "",
     queryRunning: false,
+    explainResult: null,
+    explainRunning: false,
+    queryResultMode: "results",
+    queryTabs: [{ id: "query-1", name: "scratch.sql", sql: "", connection_scope: "" }],
+    activeQueryTabID: "query-1",
+    queryHistory: [],
+    savedQueries: [],
+    recentObjects: [],
+    pinnedObjects: [],
+    workspacePanel: "",
+    schemaSnapshots: [],
+    schemaDiff: null,
+    relatedNavigation: [],
     connectionFormOpen: false,
     connectionAddStep: "choose",
     connectionEngine: "sqlite",
@@ -86,6 +103,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       port: "5432",
       username: "",
       password: "",
+      password_env: "",
+      secret_service: "",
+      secret_account: "",
       database: "",
       ssl_mode: "disable",
     },
@@ -95,8 +115,83 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     postgresFormTab: "general",
     postgresURLTimer: 0,
     connectingID: "",
+    editingConnectionID: "",
+    testingConnection: false,
     settings: { rowLimit: 100, statementTimeout: 15 },
   };
+
+  const workspaceStorageKey = "rowake.workspace.v1";
+
+  function connectionScope(connection = currentConnection()) {
+    if (!connection) return "";
+    return [connection.engine, connection.address, connection.database].join(":");
+  }
+
+  function activeQueryTab() {
+    let tab = state.queryTabs.find(item => item.id === state.activeQueryTabID);
+    if (!tab) {
+      tab = state.queryTabs[0] || { id: `query-${Date.now()}`, name: "scratch.sql", sql: "", connection_scope: "" };
+      if (!state.queryTabs.length) state.queryTabs = [tab];
+      state.activeQueryTabID = tab.id;
+    }
+    return tab;
+  }
+
+  function syncActiveQuery(value = state.querySQL) {
+    const tab = activeQueryTab();
+    tab.sql = String(value || "").slice(0, 1_000_000);
+    tab.connection_scope = tab.connection_scope || connectionScope();
+    state.querySQL = tab.sql;
+  }
+
+  function loadWorkspace() {
+    try {
+      const raw = localStorage.getItem(workspaceStorageKey);
+      const parsed = normalizeWorkspace(raw);
+      if (!parsed) {
+        if (raw) localStorage.removeItem(workspaceStorageKey);
+        return;
+      }
+      const tabs = parsed.query_tabs;
+      if (tabs.length) state.queryTabs = tabs;
+      state.activeQueryTabID = tabs.some(tab => tab.id === parsed.active_query_tab_id)
+        ? parsed.active_query_tab_id
+        : state.queryTabs[0].id;
+      state.queryHistory = parsed.query_history;
+      state.savedQueries = parsed.saved_queries;
+      state.recentObjects = parsed.recent_objects;
+      state.pinnedObjects = parsed.pinned_objects;
+      state.schemaSnapshots = parsed.schema_snapshots;
+      state.settings = parsed.settings;
+      state.querySQL = activeQueryTab().sql;
+    } catch (_) {
+      localStorage.removeItem(workspaceStorageKey);
+    }
+  }
+
+  function persistWorkspace() {
+    clearTimeout(workspacePersistTimer);
+    workspacePersistTimer = window.setTimeout(() => {
+      try {
+        syncActiveQuery();
+        localStorage.setItem(workspaceStorageKey, JSON.stringify({
+          version: WORKSPACE_VERSION,
+          query_tabs: state.queryTabs,
+          active_query_tab_id: state.activeQueryTabID,
+          query_history: state.queryHistory,
+          saved_queries: state.savedQueries,
+          recent_objects: state.recentObjects,
+          pinned_objects: state.pinnedObjects,
+          schema_snapshots: state.schemaSnapshots,
+          settings: state.settings,
+        }));
+      } catch (_) {
+        // The active session remains usable if private mode or storage quotas reject persistence.
+      }
+    }, 120);
+  }
+
+  loadWorkspace();
 
   const queryHighlighting = syntaxHighlighting(HighlightStyle.define([
     { tag: tags.keyword, color: "#c8b4e5", fontWeight: "620" },
@@ -260,14 +355,18 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
   }
 
   function applyInspectorFormat(element, formatted) {
+    element.className = "inspector-value";
+    element.innerHTML = inspectorFormatHTML(formatted);
+  }
+
+  function inspectorFormatHTML(formatted) {
     const display = formatted.kind === "json" && formatted.pretty
       ? `<pre>${html(formatted.pretty)}</pre>`
       : `<span class="${valueFormatClass(formatted, false)}">${html(formatted.display)}</span>`;
     const raw = formatted.rawDiffers
       ? `<details class="raw-value"><summary>Raw value</summary><code>${html(formatted.raw)}</code></details>`
       : "";
-    element.className = "inspector-value";
-    element.innerHTML = `${display}${raw}`;
+    return `${display}${raw}`;
   }
 
   function queueValueFormat(value, column, mode) {
@@ -351,6 +450,12 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     return new Intl.NumberFormat().format(Number(value || 0));
   }
 
+  function capturedLabel(value) {
+    const date = new Date(value || "");
+    if (Number.isNaN(date.getTime())) return "capture time unavailable";
+    return `captured ${new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(date)}`;
+  }
+
   function navigate(route) {
     const path = route.startsWith("/") ? route : `/${route}`;
     if (location.hash === `#${path}`) renderRoute();
@@ -371,6 +476,8 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
   function shell(content, active = "browse", options = {}) {
     if (queryEditorView) {
       state.querySQL = queryEditorView.state.doc.toString();
+      syncActiveQuery(state.querySQL);
+      persistWorkspace();
       queryEditorView.destroy();
       queryEditorView = null;
     }
@@ -476,37 +583,82 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         schema: preferred?.schema || firstSchema?.name || "",
         table: preferred?.name || "",
       };
+      state.tableFilters = [];
+      state.tableSort = null;
+      state.tableCursor = "";
     }
     if (state.selected.table) await loadTable(false);
   }
 
-  async function loadTable(render = true) {
+  async function loadTable(render = true, cursor = state.tableCursor) {
     if (!state.connectionID || !state.selected.table) return;
+    tableRequestController?.abort();
+    tableRequestController = new AbortController();
     state.tableLoading = true;
     if (render && state.route === "browse") renderBrowse();
     try {
-      const params = new URLSearchParams({
-        connection_id: state.connectionID,
-        schema: state.selected.schema,
-        table: state.selected.table,
-        limit: String(state.settings.rowLimit),
+      state.snapshot = await api("/api/v1/table/page", {
+        method: "POST",
+        signal: tableRequestController.signal,
+        body: JSON.stringify({
+          connection_id: state.connectionID,
+          schema: state.selected.schema,
+          table: state.selected.table,
+          limit: state.settings.rowLimit,
+          timeout_seconds: state.settings.statementTimeout,
+          cursor: cursor || "",
+          filters: state.tableFilters.map(({ column, operator, value }) => ({ column, operator, value })),
+          sort: state.tableSort,
+        }),
       });
-      state.snapshot = await api(`/api/v1/table?${params}`);
+      state.tableCursor = cursor || "";
       state.selectedRow = 0;
       state.selectedColumn = 0;
       state.inspectorOpen = false;
       state.tableSearch = "";
-      state.tableFilters = [];
-      state.tableSort = null;
       state.dataControl = "";
-      state.querySQL = `SELECT *\nFROM ${quoteIdentifier(state.selected.schema)}.${quoteIdentifier(state.selected.table)}\nLIMIT ${state.settings.rowLimit};`;
+      rememberObject(state.selected.schema, state.selected.table);
     } catch (error) {
-      state.snapshot = null;
-      toast(error.message, "error");
+      if (error?.name !== "AbortError") {
+        state.snapshot = null;
+        toast(error.message, "error");
+      }
     } finally {
       state.tableLoading = false;
       if (render && state.route === "browse") renderBrowse();
     }
+  }
+
+  function rememberObject(schema, table) {
+    const item = { connection_scope: connectionScope(), schema, table, visited_at: new Date().toISOString() };
+    const key = `${item.connection_scope}:${schema}.${table}`;
+    state.recentObjects = [item, ...state.recentObjects.filter(candidate =>
+      `${candidate.connection_scope}:${candidate.schema}.${candidate.table}` !== key
+    )].slice(0, 50);
+    persistWorkspace();
+  }
+
+  function objectKey(item) {
+    return `${item.connection_scope}:${item.schema}.${item.table}`;
+  }
+
+  function isSelectedObjectPinned() {
+    const key = objectKey({ connection_scope: connectionScope(), schema: state.selected.schema, table: state.selected.table });
+    return state.pinnedObjects.some(item => objectKey(item) === key);
+  }
+
+  function toggleSelectedObjectPin() {
+    const item = { connection_scope: connectionScope(), schema: state.selected.schema, table: state.selected.table, pinned_at: new Date().toISOString() };
+    const key = objectKey(item);
+    if (state.pinnedObjects.some(candidate => objectKey(candidate) === key)) {
+      state.pinnedObjects = state.pinnedObjects.filter(candidate => objectKey(candidate) !== key);
+      toast(`Unpinned ${item.table}`);
+    } else {
+      state.pinnedObjects = [item, ...state.pinnedObjects.filter(candidate => objectKey(candidate) !== key)].slice(0, 50);
+      toast(`Pinned ${item.table}`);
+    }
+    persistWorkspace();
+    renderBrowse();
   }
 
   function quoteIdentifier(value) {
@@ -671,6 +823,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
             <span>${html(connection?.address || "")}</span>
           </div>
         </div>
+        ${mobileObjectPicker()}
         <div class="database-workbench ${hasInspector ? "has-inspector" : ""}">
           ${renderCatalogRail()}
           ${renderTableSurface()}
@@ -678,17 +831,32 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         </div>
       </section>`;
     shell(body, "browse", { workspace: true });
+    if ((!state.topology || state.topology.connection_id !== state.connectionID) && !state.topologyLoading) loadTopology();
+  }
+
+  function mobileObjectPicker() {
+    const objects = (state.catalog?.schemas || []).flatMap((schema, schemaIndex) =>
+      schema.tables.map((table, tableIndex) => ({ schema, table, value: `${schemaIndex}:${tableIndex}` }))
+    );
+    if (!objects.length) return "";
+    return `<label class="mobile-object-picker"><span>Database object</span><select id="mobile-object-picker"><option value="">Choose a table or view</option>${objects.map(item => `<option value="${item.value}" ${item.table.schema === state.selected.schema && item.table.name === state.selected.table ? "selected" : ""}>${html(item.schema.name)}.${html(item.table.name)}</option>`).join("")}</select></label>`;
   }
 
   function renderCatalogRail() {
     const schemas = state.catalog?.schemas || [];
     const search = state.catalogSearch.toLowerCase().trim();
+    const scope = connectionScope();
+    const pinned = state.pinnedObjects.filter(item => item.connection_scope === scope);
+    const recent = state.recentObjects.filter(item => item.connection_scope === scope && !pinned.some(pin => objectKey(pin) === objectKey(item))).slice(0, 5);
+    const renderShortcut = (item, pinnedItem = false) => `<button type="button" class="catalog-item object-shortcut" data-action="select-table" data-schema="${html(item.schema)}" data-table="${html(item.table)}"><span class="object-icon">${pinnedItem ? "◆" : "◷"}</span><span class="object-name">${html(item.table)}</span><small>${html(item.schema)}</small></button>`;
     return `<aside class="catalog-rail" aria-label="Database objects">
       <div class="rail-header">
         <strong>Objects</strong>
       </div>
       <div class="rail-search"><span>⌕</span><input id="catalog-search" type="search" placeholder="Filter objects" value="${html(state.catalogSearch)}"></div>
       <div class="catalog-tree">
+        ${!search && pinned.length ? `<section class="object-shortcuts"><header>Pinned</header>${pinned.map(item => renderShortcut(item, true)).join("")}</section>` : ""}
+        ${!search && recent.length ? `<section class="object-shortcuts"><header>Recent</header>${recent.map(item => renderShortcut(item)).join("")}</section>` : ""}
         ${schemas.map(schema => {
           const tables = schema.tables.filter(table => !search || `${schema.name}.${table.name}`.toLowerCase().includes(search));
           if (search && !tables.length) return "";
@@ -729,8 +897,10 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
           <span class="surface-schema">${html(snapshot.schema)}</span>
         </div>
         <div class="surface-actions">
+          ${state.relatedNavigation.length ? `<button type="button" class="btn small" data-action="back-related">← Back</button>` : ""}
           <button type="button" class="btn small" data-action="copy-table-name">Copy name</button>
-          <button type="button" class="btn small" data-nav="query">Query</button>
+          <button type="button" class="btn small" data-action="toggle-object-pin">${isSelectedObjectPinned() ? "Unpin" : "Pin"}</button>
+          <button type="button" class="btn small" data-action="query-table">Query</button>
           ${state.tableTab === "data" && snapshot.rows.length ? `<button type="button" class="icon-button inspector-toggle ${state.inspectorOpen ? "active" : ""}" data-action="toggle-inspector" aria-label="${state.inspectorOpen ? "Collapse selected row" : "Open selected row"}" title="${state.inspectorOpen ? "Collapse selected row" : "Open selected row"}" aria-expanded="${state.inspectorOpen}">
             <span class="panel-toggle-icon" aria-hidden="true"></span>
           </button>` : ""}
@@ -753,25 +923,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
 
   function filteredRows(snapshot) {
     const term = state.tableSearch.toLowerCase().trim();
-    const columnIndexes = new Map(snapshot.columns.map((column, index) => [column.name, index]));
-    const rows = snapshot.rows.map((row, index) => ({ row, index })).filter(({ row }) => {
-      if (term && !row.some(value => String(value ?? "null").toLowerCase().includes(term))) return false;
-      return state.tableFilters.every(filter => {
-        const columnIndex = columnIndexes.get(filter.column);
-        return columnIndex !== undefined && valueMatchesFilter(row[columnIndex], filter);
-      });
-    });
-    if (state.tableSort) {
-      const columnIndex = columnIndexes.get(state.tableSort.column);
-      if (columnIndex !== undefined) {
-        const direction = state.tableSort.direction === "desc" ? -1 : 1;
-        rows.sort((left, right) => {
-          const comparison = compareValues(left.row[columnIndex], right.row[columnIndex]);
-          return comparison === 0 ? left.index - right.index : comparison * direction;
-        });
-      }
-    }
-    return rows;
+    return snapshot.rows.map((row, index) => ({ row, index })).filter(({ row }) =>
+      !term || row.some(value => String(value ?? "null").toLowerCase().includes(term))
+    );
   }
 
   function valueMatchesFilter(value, filter) {
@@ -863,6 +1017,10 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
 
   function renderRows(snapshot) {
     const rows = filteredRows(snapshot);
+    const relatedByColumn = new Map();
+    selectedRelationshipGroups().outgoing.forEach(group => group.relationships.forEach(relationship => {
+      relatedByColumn.set(relationship.from_column, group);
+    }));
     const selectedVisible = rows.some(item => item.index === state.selectedRow);
     if (!selectedVisible && rows.length) state.selectedRow = rows[0].index;
     state.selectedColumn = Math.min(
@@ -871,11 +1029,11 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     );
     return `<div class="data-instrument">
       <div class="data-toolbar">
-        <div class="row-search"><span>⌕</span><input id="table-search" type="search" placeholder="Filter loaded rows" value="${html(state.tableSearch)}"></div>
+        <div class="row-search"><span>⌕</span><input id="table-search" type="search" placeholder="Search this page" value="${html(state.tableSearch)}"></div>
         <div class="data-controls">
           <button type="button" class="btn small toolbar-button ${state.dataControl === "filter" ? "active" : ""}" data-action="toggle-data-control" data-control="filter">Filter${state.tableFilters.length ? `<span class="toolbar-count">${state.tableFilters.length}</span>` : ""}</button>
           <button type="button" class="btn small toolbar-button ${state.dataControl === "sort" ? "active" : ""}" data-action="toggle-data-control" data-control="sort">Sort${state.tableSort ? `<span class="sort-direction">${state.tableSort.direction === "desc" ? "↓" : "↑"}</span>` : ""}</button>
-          <span class="read-scope">${state.settings.rowLimit} row preview</span>
+          <span class="read-scope">${snapshot.row_count} loaded · ${html(capturedLabel(snapshot.captured_at))}</span>
           <button type="button" class="btn small" data-action="reload-table">↻ Reload</button>
         </div>
       </div>
@@ -884,19 +1042,24 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         <table class="result-grid" aria-label="Table data. Select a data cell, then use the arrow keys to move between cells.">
           <thead><tr><th class="row-number-head">#</th>${snapshot.columns.map(column => `<th><button type="button" class="column-header-control" data-action="sort-column" data-column="${html(column.name)}"><span>${html(column.name)}${state.tableSort?.column === column.name ? `<i>${state.tableSort.direction === "desc" ? "↓" : "↑"}</i>` : ""}</span><small>${html(column.data_type)}</small></button></th>`).join("")}</tr></thead>
           <tbody>
-            ${rows.map(({ row, index }, visibleIndex) => `<tr class="selectable-row ${index === state.selectedRow ? "selected" : ""}" data-action="select-row" data-row="${index}">
+            ${rows.map(({ row, index }, visibleIndex) => `<tr class="selectable-row ${index === state.selectedRow ? "selected" : ""}" data-action="select-row" data-row="${index}" aria-selected="${index === state.selectedRow}">
               <td class="row-number">${visibleIndex + 1}</td>
               ${row.map((value, columnIndex) => {
                 const active = index === state.selectedRow && columnIndex === state.selectedColumn;
-                return `<td class="data-cell ${active ? "active-cell" : ""}" data-action="select-cell" data-row="${index}" data-column="${columnIndex}" tabindex="${active ? "0" : "-1"}">${formatCell(value, snapshot.columns[columnIndex])}</td>`;
+                const related = relatedByColumn.get(snapshot.columns[columnIndex].name);
+                return `<td class="data-cell ${active ? "active-cell" : ""} ${related ? "foreign-key-cell" : ""}" data-action="select-cell" data-row="${index}" data-column="${columnIndex}" tabindex="${active ? "0" : "-1"}">${formatCell(value, snapshot.columns[columnIndex])}${related ? `<button type="button" class="cell-relationship-link" data-action="open-related-cell" data-row="${index}" data-relationship="${html(related.id)}" aria-label="Open related record" ${value === null || value === undefined ? "disabled" : ""}>↗</button>` : ""}</td>`;
               }).join("")}
             </tr>`).join("") || `<tr><td class="grid-empty" colspan="${snapshot.columns.length + 1}">No loaded rows match the current search and filters.</td></tr>`}
           </tbody>
         </table>
       </div>
-      <footer class="result-status">
-        <div><span class="status-light good"></span><strong>${rows.length}</strong> shown · ${fullNumber(snapshot.total_rows)} total rows</div>
-        <div><span>${snapshot.duration_ms} ms</span><i></i><span>${snapshot.truncated ? "bounded result" : "complete result"}</span><i></i><span>${snapshot.capabilities.can_write ? "write enabled" : "read-only"}</span></div>
+      <footer class="result-status paged-status">
+        <div><span class="status-light good"></span><strong>${rows.length}</strong> shown on this page${state.tableSearch ? " after local search" : ""}</div>
+        <div class="page-controls">
+          <span>${snapshot.duration_ms} ms</span><i></i><span>${snapshot.byte_limited ? "byte cap reached" : snapshot.has_more ? "more rows available" : "end of result"}</span><i></i><span>read-only</span>
+          <button type="button" class="btn small" data-action="previous-table-page" ${snapshot.previous_cursor ? "" : "disabled"}>Previous</button>
+          <button type="button" class="btn small" data-action="next-table-page" ${snapshot.next_cursor ? "" : "disabled"}>Next</button>
+        </div>
       </footer>
     </div>`;
   }
@@ -912,26 +1075,24 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     const rows = filteredRows(snapshot);
     if (!rows.some(item => item.index === rowIndex)) return;
 
-    const currentScroll = document.querySelector(".data-instrument > .grid-scroll");
-    const scrollPosition = currentScroll
-      ? { top: currentScroll.scrollTop, left: currentScroll.scrollLeft }
-      : null;
+    const grid = document.querySelector(".data-instrument > .grid-scroll");
+    const previousRow = grid?.querySelector(".selectable-row.selected");
+    const previousCell = grid?.querySelector(".data-cell.active-cell");
     state.selectedRow = rowIndex;
     state.selectedColumn = Math.min(Math.max(columnIndex, 0), snapshot.columns.length - 1);
-    renderBrowse();
-
-    requestAnimationFrame(() => {
-      const nextScroll = document.querySelector(".data-instrument > .grid-scroll");
-      if (nextScroll && scrollPosition) {
-        nextScroll.scrollTop = scrollPosition.top;
-        nextScroll.scrollLeft = scrollPosition.left;
-      }
-      const cell = nextScroll?.querySelector(
-        `.data-cell[data-row="${state.selectedRow}"][data-column="${state.selectedColumn}"]`
-      );
-      cell?.focus({ preventScroll: true });
-      cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
-    });
+    const nextRow = grid?.querySelector(`.selectable-row[data-row="${state.selectedRow}"]`);
+    const nextCell = nextRow?.querySelector(`.data-cell[data-column="${state.selectedColumn}"]`);
+    previousRow?.classList.remove("selected");
+    previousRow?.setAttribute("aria-selected", "false");
+    previousCell?.classList.remove("active-cell");
+    previousCell?.setAttribute("tabindex", "-1");
+    nextRow?.classList.add("selected");
+    nextRow?.setAttribute("aria-selected", "true");
+    nextCell?.classList.add("active-cell");
+    nextCell?.setAttribute("tabindex", "0");
+    if (state.inspectorOpen) refreshRowInspector();
+    nextCell?.focus({ preventScroll: true });
+    nextCell?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
   function moveTableCell(cell, key) {
@@ -1075,7 +1236,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     </div>`;
   }
 
-  function renderRowInspector() {
+  function renderRowInspector(immediate = false) {
     const snapshot = state.snapshot;
     const row = snapshot?.rows[state.selectedRow];
     if (!snapshot || !row) return "";
@@ -1094,19 +1255,126 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         <button type="button" class="btn small" data-action="copy-row">Copy JSON</button>
         <button type="button" class="btn small" data-action="copy-where">Copy WHERE</button>
       </div>
+      ${renderRowRelationships(snapshot, row)}
       <dl class="row-fields">
         ${snapshot.columns.map((column, index) => `<div class="row-field">
           <dt><span>${html(column.name)}</span><small>${html(column.data_type)}</small></dt>
-          <dd>${inspectorValue(row[index], column)}</dd>
+          <dd>${inspectorValue(row[index], column, immediate)}</dd>
         </div>`).join("")}
       </dl>
       <footer class="inspector-foot"><span class="lock-mark">⌑</span><span>Read-only</span></footer>
     </aside>`;
   }
 
-  function inspectorValue(value, column = {}) {
+  function refreshRowInspector() {
+    const current = document.querySelector(".row-inspector");
+    if (!current) return;
+    const scrollTop = current.scrollTop;
+    current.insertAdjacentHTML("afterend", renderRowInspector(true));
+    const replacement = current.nextElementSibling;
+    current.remove();
+    if (replacement?.classList.contains("row-inspector")) replacement.scrollTop = scrollTop;
+  }
+
+  function inspectorValue(value, column = {}, immediate = false) {
+    if (immediate) {
+      try {
+        const raw = rawDatabaseValue(value);
+        const formatted = formatDatabaseValue(value, column, { raw });
+        return `<div class="inspector-value">${inspectorFormatHTML(formatted)}</div>`;
+      } catch (_) {
+        return `<div class="inspector-value"><span>${html(rawDatabaseValue(value))}</span></div>`;
+      }
+    }
     const pending = queueValueFormat(value, column, "inspector");
     return `<div id="${pending.id}" class="inspector-value value-format-pending"><span>${html(pending.raw)}</span></div>`;
+  }
+
+  function selectedRelationshipGroups() {
+    const topology = state.topology;
+    if (!topology) return { outgoing: [], incoming: [] };
+    const group = relationships => {
+      const grouped = new Map();
+      relationships.forEach(relationship => {
+        const key = relationship.constraint_id || relationship.id;
+        if (!grouped.has(key)) grouped.set(key, { id: key, relationships: [] });
+        grouped.get(key).relationships.push(relationship);
+      });
+      return [...grouped.values()];
+    };
+    return {
+      outgoing: group(topology.relationships.filter(relationship =>
+        (relationship.from_schema || "main") === state.selected.schema && relationship.from_table === state.selected.table
+      )),
+      incoming: group(topology.relationships.filter(relationship =>
+        (relationship.to_schema || "main") === state.selected.schema && relationship.to_table === state.selected.table
+      )),
+    };
+  }
+
+  function renderRowRelationships(snapshot, row) {
+    const groups = selectedRelationshipGroups();
+    const renderGroup = (group, direction) => {
+      const first = group.relationships[0];
+      const columns = direction === "outgoing"
+        ? group.relationships.map(item => item.from_column)
+        : group.relationships.map(item => item.to_column);
+      const missing = columns.some(column => {
+        const index = snapshot.columns.findIndex(item => item.name === column);
+        return index < 0 || row[index] === null || row[index] === undefined;
+      });
+      const target = direction === "outgoing"
+        ? `${first.to_schema || "main"}.${first.to_table}`
+        : `${first.from_schema || "main"}.${first.from_table}`;
+      return `<button type="button" class="relationship-action" data-action="open-related" data-relationship="${html(group.id)}" data-direction="${direction}" ${missing ? "disabled" : ""}><span>${direction === "outgoing" ? "Parent" : "Children"}</span><strong>${html(target)}</strong><small>${html(columns.join(" + "))}</small></button>`;
+    };
+    if (!groups.outgoing.length && !groups.incoming.length) return "";
+    return `<section class="row-relationships"><header><strong>Related records</strong><span>Bounded navigation</span></header><div>${groups.outgoing.map(group => renderGroup(group, "outgoing")).join("")}${groups.incoming.map(group => renderGroup(group, "incoming")).join("")}</div></section>`;
+  }
+
+  async function openRelatedRelationship(relationshipID, direction) {
+    const snapshot = state.snapshot;
+    const row = snapshot?.rows[state.selectedRow];
+    if (!snapshot || !row || !state.topology) return;
+    const relationships = state.topology.relationships.filter(item => (item.constraint_id || item.id) === relationshipID);
+    if (!relationships.length) return;
+    const first = relationships[0];
+    const target = direction === "incoming"
+      ? { schema: first.from_schema || "main", table: first.from_table }
+      : { schema: first.to_schema || "main", table: first.to_table };
+    const filters = relationships.map(relationship => {
+      const sourceColumn = direction === "incoming" ? relationship.to_column : relationship.from_column;
+      const targetColumn = direction === "incoming" ? relationship.from_column : relationship.to_column;
+      const sourceIndex = snapshot.columns.findIndex(column => column.name === sourceColumn);
+      state.filterSerial += 1;
+      return { id: state.filterSerial, column: targetColumn, operator: "equals", value: String(row[sourceIndex] ?? "") };
+    });
+    state.relatedNavigation.push({
+      selected: { ...state.selected },
+      filters: state.tableFilters.map(filter => ({ ...filter })),
+      sort: state.tableSort ? { ...state.tableSort } : null,
+      cursor: state.tableCursor,
+    });
+    state.selected = target;
+    state.tableFilters = filters;
+    state.tableSort = null;
+    state.tableCursor = "";
+    state.snapshot = null;
+    state.inspectorOpen = false;
+    navigate("browse");
+    await loadTable(true, "");
+  }
+
+  async function backRelatedNavigation() {
+    const previous = state.relatedNavigation.pop();
+    if (!previous) return;
+    state.selected = previous.selected;
+    state.tableFilters = previous.filters;
+    state.tableSort = previous.sort;
+    state.tableCursor = previous.cursor || "";
+    state.snapshot = null;
+    state.inspectorOpen = false;
+    await loadTable(true, state.tableCursor);
   }
 
   async function loadTopology(force = false) {
@@ -1117,6 +1385,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       let topology = !force ? state.topologyCache.get(state.connectionID) : null;
       if (!topology) {
         topology = await api(`/api/v1/topology?connection_id=${encodeURIComponent(state.connectionID)}`);
+        topology.captured_at = new Date().toISOString();
         state.topologyCache.set(state.connectionID, topology);
       }
       state.topology = topology;
@@ -1128,6 +1397,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       state.topologyLoading = false;
       if (state.route === "topology") renderTopology();
       else if (state.route === "query") refreshQueryEditorLanguage();
+      else if (state.route === "browse") renderBrowse();
     }
   }
 
@@ -1201,6 +1471,75 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     </section>`;
   }
 
+  async function captureSchemaSnapshot() {
+    const snapshot = await api(`/api/v1/schema-snapshot?connection_id=${encodeURIComponent(state.connectionID)}`);
+    snapshot.connection_scope = connectionScope();
+    state.schemaSnapshots = [snapshot, ...state.schemaSnapshots.filter(item => item.connection_scope !== snapshot.connection_scope)].slice(0, 10);
+    state.schemaDiff = null;
+    persistWorkspace();
+    renderTopology();
+    toast(`Captured ${snapshot.database} schema`);
+  }
+
+  async function compareSchemaSnapshot() {
+    const baseline = state.schemaSnapshots.find(item => item.connection_scope === connectionScope());
+    if (!baseline) {
+      toast("Capture a schema snapshot before comparing", "error");
+      return;
+    }
+    const current = await api(`/api/v1/schema-snapshot?connection_id=${encodeURIComponent(state.connectionID)}`);
+    current.connection_scope = connectionScope();
+    state.schemaDiff = diffSchemaSnapshots(baseline, current);
+    renderTopology();
+  }
+
+  function diffSchemaSnapshots(before, after) {
+    const changes = [];
+    const tableKey = table => `${table.schema}.${table.name}`;
+    const beforeTables = new Map((before.topology?.tables || []).map(table => [tableKey(table), table]));
+    const afterTables = new Map((after.topology?.tables || []).map(table => [tableKey(table), table]));
+    beforeTables.forEach((table, key) => {
+      if (!afterTables.has(key)) changes.push({ kind: "removed", path: key, detail: "Table removed" });
+    });
+    afterTables.forEach((table, key) => {
+      if (!beforeTables.has(key)) {
+        changes.push({ kind: "added", path: key, detail: "Table added" });
+        return;
+      }
+      const previous = beforeTables.get(key);
+      const previousColumns = new Map((previous.columns || []).map(column => [column.name, column]));
+      const nextColumns = new Map((table.columns || []).map(column => [column.name, column]));
+      previousColumns.forEach((column, name) => {
+        if (!nextColumns.has(name)) changes.push({ kind: "removed", path: `${key}.${name}`, detail: "Column removed" });
+      });
+      nextColumns.forEach((column, name) => {
+        const old = previousColumns.get(name);
+        if (!old) changes.push({ kind: "added", path: `${key}.${name}`, detail: `Column added (${column.data_type})` });
+        else if (JSON.stringify([old.data_type, old.nullable, old.default, old.primary_key]) !== JSON.stringify([column.data_type, column.nullable, column.default, column.primary_key])) {
+          changes.push({ kind: "changed", path: `${key}.${name}`, detail: `${old.data_type} → ${column.data_type}` });
+        }
+      });
+      const indexSignature = value => JSON.stringify((value.indexes || []).map(index => [index.name, index.columns, index.unique, index.definition]).sort());
+      if (indexSignature(previous) !== indexSignature(table)) changes.push({ kind: "changed", path: key, detail: "Indexes changed" });
+    });
+    const relationshipSignature = snapshot => JSON.stringify((snapshot.topology?.relationships || []).map(item => [item.constraint_id, item.from_schema, item.from_table, item.from_column, item.to_schema, item.to_table, item.to_column, item.on_update, item.on_delete]).sort());
+    if (relationshipSignature(before) !== relationshipSignature(after)) changes.push({ kind: "changed", path: "relationships", detail: "Foreign-key relationships changed" });
+    return { before, after, changes, captured_at: after.captured_at };
+  }
+
+  function renderSchemaDiff() {
+    const diff = state.schemaDiff;
+    if (!diff) return "";
+    return `<section class="schema-diff" aria-label="Schema changes"><header><div><strong>Schema comparison</strong><span>${html(capturedLabel(diff.before.captured_at))} → ${html(capturedLabel(diff.after.captured_at))}</span></div><div><button type="button" class="btn small" data-action="copy-schema-diff" data-format="markdown">Copy Markdown</button><button type="button" class="btn small" data-action="copy-schema-diff" data-format="json">Copy JSON</button><button type="button" class="icon-button subtle-button" data-action="close-schema-diff" aria-label="Close comparison">×</button></div></header><div>${diff.changes.map(change => `<article class="${html(change.kind)}"><span>${html(change.kind)}</span><strong>${html(change.path)}</strong><small>${html(change.detail)}</small></article>`).join("") || `<div class="schema-diff-empty"><strong>No schema changes</strong><span>The current schema matches the captured snapshot.</span></div>`}</div></section>`;
+  }
+
+  function schemaDiffMarkdown(diff) {
+    const lines = [`# Schema diff: ${diff.after.database}`, "", `Baseline: ${diff.before.captured_at}`, `Current: ${diff.after.captured_at}`, ""];
+    if (!diff.changes.length) lines.push("No schema changes.");
+    else diff.changes.forEach(change => lines.push(`- **${change.kind}** \`${change.path}\`: ${change.detail}`));
+    return lines.join("\n");
+  }
+
   function renderTopology() {
     const connection = currentConnection();
     if (!connection) {
@@ -1224,13 +1563,14 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     const allExpanded = state.topologyExpanded.size === topology.tables.length;
     const body = `<section class="workspace topology-page">
       <header class="workspace-header">
-        <div class="workspace-identity"><span class="eyebrow">Schema map</span><div class="workspace-title-row"><h1 class="workspace-title">${html(connection.database)}</h1><span class="status good">live schema</span></div></div>
-        <div class="header-actions">${connectionPicker()}<button type="button" class="btn" data-action="refresh-topology">↻ <span>Refresh</span></button><button type="button" class="btn primary" data-nav="browse">Browse data</button></div>
+        <div class="workspace-identity"><span class="eyebrow">Schema map</span><div class="workspace-title-row"><h1 class="workspace-title">${html(connection.database)}</h1><span class="status info">captured schema</span></div></div>
+        <div class="header-actions">${connectionPicker()}<button type="button" class="btn" data-action="capture-schema">Capture</button><button type="button" class="btn" data-action="compare-schema">Compare</button><button type="button" class="btn" data-action="refresh-topology">↻ <span>Refresh</span></button><button type="button" class="btn primary" data-nav="browse">Browse data</button></div>
       </header>
       <div class="command-strip">
         <div class="breadcrumb"><span>${html(engineLabel(connection.engine))}</span><i>/</i><strong>${html(connection.database)}</strong><i>/</i><span>${connection.engine === "sqlite" ? "main" : "all schemas"}</span></div>
-        <div class="command-signals"><span><i class="signal-dot"></i>Introspected from database</span><span>${topology.relationships.length} foreign keys</span></div>
+        <div class="command-signals"><span><i class="signal-dot"></i>${html(capturedLabel(topology.captured_at))}</span><span>${topology.relationships.length} foreign keys</span></div>
       </div>
+      ${renderSchemaDiff()}
       <div class="topology-toolbar">
         <div class="topology-summary"><span><strong>${topology.tables.length}</strong> tables</span><i></i><span><strong>${topology.relationships.length}</strong> relationships</span><i></i><span><strong>${columnCount}</strong> columns</span></div>
         <div class="topology-controls">
@@ -1341,6 +1681,86 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       node.addEventListener("focusout", clearTopologyHighlight);
     });
     drawDatabaseTopology();
+  }
+
+  function newQueryTab(sql = "", name = "") {
+    if (queryEditorView) syncActiveQuery(queryEditorView.state.doc.toString());
+    const id = `query-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const tab = {
+      id,
+      name: String(name || `Query ${state.queryTabs.length + 1}`).slice(0, 80),
+      sql: String(sql || "").slice(0, 1_000_000),
+      connection_scope: connectionScope(),
+    };
+    state.queryTabs.push(tab);
+    state.activeQueryTabID = id;
+    state.querySQL = tab.sql;
+    state.queryResult = null;
+    state.explainResult = null;
+    state.queryResultMode = "results";
+    persistWorkspace();
+    return tab;
+  }
+
+  function activateQueryTab(id) {
+    if (queryEditorView) syncActiveQuery(queryEditorView.state.doc.toString());
+    if (!state.queryTabs.some(tab => tab.id === id)) return;
+    state.activeQueryTabID = id;
+    state.querySQL = activeQueryTab().sql;
+    state.queryResult = null;
+    state.explainResult = null;
+    state.queryResultMode = "results";
+    persistWorkspace();
+    renderQuery();
+  }
+
+  function closeQueryTab(id) {
+    if (state.queryTabs.length === 1) {
+      const tab = state.queryTabs[0];
+      tab.sql = "";
+      tab.name = "scratch.sql";
+      state.querySQL = "";
+    } else {
+      const index = state.queryTabs.findIndex(tab => tab.id === id);
+      if (index < 0) return;
+      state.queryTabs.splice(index, 1);
+      if (state.activeQueryTabID === id) {
+        state.activeQueryTabID = state.queryTabs[Math.max(0, index - 1)].id;
+        state.querySQL = activeQueryTab().sql;
+      }
+    }
+    state.queryResult = null;
+    state.explainResult = null;
+    persistWorkspace();
+    renderQuery();
+  }
+
+  function queryWorkspacePanel() {
+    if (!state.workspacePanel) return "";
+    const scope = connectionScope();
+    const items = state.workspacePanel === "saved"
+      ? state.savedQueries.filter(item => !item.connection_scope || item.connection_scope === scope)
+      : state.queryHistory.filter(item => !item.connection_scope || item.connection_scope === scope);
+    const label = state.workspacePanel === "saved" ? "Saved queries" : "Query history";
+    return `<aside class="query-library" aria-label="${label}">
+      <header><div><strong>${label}</strong><span>${items.length} ${items.length === 1 ? "item" : "items"} for this connection</span></div><button type="button" class="icon-button subtle-button" data-action="close-query-library" aria-label="Close ${label}">×</button></header>
+      <div class="query-library-list">
+        ${items.map(item => `<article>
+          <button type="button" class="query-library-open" data-action="open-${state.workspacePanel}-query" data-query-id="${html(item.id)}"><strong>${html(item.name || "Untitled query")}</strong><code>${html(String(item.sql || "").replace(/\s+/g, " ").slice(0, 140))}</code><span>${html(capturedLabel(item.created_at))}</span></button>
+          ${state.workspacePanel === "saved" ? `<button type="button" class="query-library-remove" data-action="remove-saved-query" data-query-id="${html(item.id)}" aria-label="Remove ${html(item.name)}">×</button>` : ""}
+        </article>`).join("") || `<div class="query-library-empty"><strong>No ${label.toLowerCase()}</strong><span>${state.workspacePanel === "saved" ? "Save the active tab to reuse it here." : "Successful statements will appear here."}</span></div>`}
+      </div>
+    </aside>`;
+  }
+
+  function renderQueryTabs() {
+    return `<div class="query-tab-strip" role="tablist" aria-label="Query tabs">
+      ${state.queryTabs.map(tab => `<div class="query-tab ${tab.id === state.activeQueryTabID ? "active" : ""}">
+        <button type="button" role="tab" aria-selected="${tab.id === state.activeQueryTabID}" data-action="select-query-tab" data-query-tab="${html(tab.id)}"><span class="editor-dot"></span>${html(tab.name)}</button>
+        <button type="button" data-action="close-query-tab" data-query-tab="${html(tab.id)}" aria-label="Close ${html(tab.name)}">×</button>
+      </div>`).join("")}
+      <button type="button" class="new-query-tab" data-action="new-query-tab" aria-label="New query tab">＋</button>
+    </div>`;
   }
 
   function queryDialect() {
@@ -1569,6 +1989,8 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         EditorView.updateListener.of(update => {
           if (!update.docChanged) return;
           state.querySQL = update.state.doc.toString();
+          syncActiveQuery(state.querySQL);
+          persistWorkspace();
           const input = update.transactions.some(transaction => transaction.isUserEvent("input"));
           const completed = update.transactions.some(transaction => transaction.isUserEvent("input.complete"));
           if (input && !completed && shouldStartQueryCompletion(update.state)) {
@@ -1596,27 +2018,33 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       </section>`, "query", { workspace: true });
       return;
     }
+    const tab = activeQueryTab();
+    state.querySQL = tab.sql;
     const result = state.queryResult;
-    const editorValue = state.querySQL || "SELECT 1 AS result;";
+    const editorValue = tab.sql || "SELECT 1 AS result;";
     const body = `<section class="workspace query-page">
       <header class="workspace-header">
         <div class="workspace-identity"><span class="eyebrow">SQL workspace</span><div class="workspace-title-row"><h1 class="workspace-title">Query</h1><span class="status info">read-only</span></div></div>
-        <div class="header-actions">${connectionPicker()}<button type="button" class="btn" data-action="format-query">Format</button><button type="button" class="btn primary" data-action="run-query" ${state.queryRunning ? "disabled" : ""}>${state.queryRunning ? "Running…" : "▶ Run"}</button></div>
+        <div class="header-actions">${connectionPicker()}<button type="button" class="btn" data-action="toggle-query-history">History</button><button type="button" class="btn" data-action="toggle-saved-queries">Saved</button><button type="button" class="btn" data-action="save-query">Save</button><button type="button" class="btn" data-action="format-query">Format</button><button type="button" class="btn" data-action="explain-query" ${state.explainRunning ? "disabled" : ""}>${state.explainRunning ? "Explaining…" : "Explain"}</button><button type="button" class="btn primary" data-action="run-query" ${state.queryRunning ? "disabled" : ""}>${state.queryRunning ? "Running…" : "▶ Run"}</button></div>
       </header>
       <div class="command-strip">
-        <div class="breadcrumb"><span>${html(connection?.name || "No connection")}</span><i>/</i><strong>scratch.sql</strong></div>
-        <div class="command-signals"><span><i class="signal-dot"></i>Cmd/Ctrl + Enter to run</span><span>${state.settings.statementTimeout}s timeout</span><span>${state.settings.rowLimit} row cap</span></div>
+        <div class="breadcrumb"><span>${html(connection?.name || "No connection")}</span><i>/</i><strong>${html(tab.name)}</strong></div>
+        <div class="command-signals"><span><i class="signal-dot"></i>Cmd/Ctrl + Enter to run</span><label class="row-cap-control">Row cap <select data-setting="row-limit"><option value="50" ${state.settings.rowLimit === 50 ? "selected" : ""}>50</option><option value="100" ${state.settings.rowLimit === 100 ? "selected" : ""}>100</option><option value="250" ${state.settings.rowLimit === 250 ? "selected" : ""}>250</option><option value="500" ${state.settings.rowLimit === 500 ? "selected" : ""}>500</option><option value="1000" ${state.settings.rowLimit === 1000 ? "selected" : ""}>1000</option></select></label><label class="row-cap-control">Timeout <select data-setting="statement-timeout"><option value="5" ${state.settings.statementTimeout === 5 ? "selected" : ""}>5s</option><option value="10" ${state.settings.statementTimeout === 10 ? "selected" : ""}>10s</option><option value="15" ${state.settings.statementTimeout === 15 ? "selected" : ""}>15s</option></select></label></div>
       </div>
+      ${renderQueryTabs()}
+      <div class="query-stage">
       <div class="query-workbench">
         <section class="query-editor-panel">
-          <header class="editor-header"><div><span class="editor-dot"></span><strong>scratch.sql</strong></div><span>${html(engineLabel(connection?.engine || "SQL"))}</span></header>
+          <header class="editor-header"><div><span class="editor-dot"></span><input class="query-name-input" value="${html(tab.name)}" maxlength="80" aria-label="Query tab name" data-query-name></div><span>${html(engineLabel(connection?.engine || "SQL"))}</span></header>
           <div id="query-editor" class="sql-editor"></div>
           <footer id="query-editor-help" class="editor-foot"><div><span>UTF-8</span><span>${html(engineLabel(connection.engine))} SQL</span><span>Read-only guard active</span></div><div><span>Ctrl+Space suggestions</span><span>Tab to complete</span></div></footer>
         </section>
         <section class="query-results-panel">
-          <header class="query-results-header"><div><strong>Results</strong>${result ? `<span>${result.row_count} rows</span>` : ""}</div><div>${result ? `<span>${result.duration_ms} ms</span><button class="btn small" type="button" data-action="copy-results">Copy JSON</button>` : ""}</div></header>
+          <header class="query-results-header"><div><button type="button" class="result-mode ${state.queryResultMode === "results" ? "active" : ""}" data-action="show-query-results">Results</button><button type="button" class="result-mode ${state.queryResultMode === "plan" ? "active" : ""}" data-action="show-query-plan">Plan</button>${result && state.queryResultMode === "results" ? `<span>${result.row_count} rows</span>` : ""}</div><div>${result && state.queryResultMode === "results" ? `<span>${result.duration_ms} ms</span><button class="btn small" type="button" data-action="copy-results">Copy JSON</button>` : ""}</div></header>
           ${renderQueryResult()}
         </section>
+      </div>
+      ${queryWorkspacePanel()}
       </div>
     </section>`;
     shell(body, "query", { workspace: true });
@@ -1625,11 +2053,25 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
   }
 
   function renderQueryResult() {
+    if (state.queryResultMode === "plan") return renderExplainResult();
     if (state.queryRunning) return `<div class="query-running"><span class="loading-track"><i></i></span><strong>Running statement</strong><small>The result remains bounded by the current row limit.</small></div>`;
     if (state.queryError) return `<div class="query-error"><span>!</span><div><strong>Query failed</strong><pre>${html(state.queryError)}</pre></div></div>`;
     const result = state.queryResult;
     if (!result) return `<div class="query-empty"><span class="empty-glyph">⌁</span><strong>No results</strong><p>Run a statement to see its result.</p></div>`;
-    return `<div class="query-result-instrument"><div class="grid-scroll"><table class="result-grid"><thead><tr><th class="row-number-head">#</th>${result.columns.map(column => `<th><span>${html(column.name)}</span><small>${html(column.data_type)}</small></th>`).join("")}</tr></thead><tbody>${result.rows.map((row, index) => `<tr><td class="row-number">${index + 1}</td>${row.map((value, columnIndex) => `<td>${formatCell(value, result.columns[columnIndex])}</td>`).join("")}</tr>`).join("")}</tbody></table></div><footer class="result-status"><div><span class="status-light good"></span><strong>${result.row_count}</strong> rows returned</div><div><span>${result.duration_ms} ms</span><i></i><span>${result.truncated ? "bounded result" : "complete result"}</span><i></i><span>read-only</span></div></footer></div>`;
+    return `<div class="query-result-instrument"><div class="grid-scroll"><table class="result-grid"><thead><tr><th class="row-number-head">#</th>${result.columns.map(column => `<th><span>${html(column.name)}</span><small>${html(column.data_type)}</small></th>`).join("")}</tr></thead><tbody>${result.rows.map((row, index) => `<tr><td class="row-number">${index + 1}</td>${row.map((value, columnIndex) => `<td>${formatCell(value, result.columns[columnIndex])}</td>`).join("")}</tr>`).join("")}</tbody></table></div><footer class="result-status"><div><span class="status-light good"></span><strong>${result.row_count}</strong> rows returned</div><div><span>${html(capturedLabel(result.captured_at))}</span><i></i><span>${result.truncated ? "bounded result" : "complete result"}</span><i></i><span>read-only</span></div></footer></div>`;
+  }
+
+  function renderExplainResult() {
+    if (state.explainRunning) return `<div class="query-running"><span class="loading-track"><i></i></span><strong>Building read-only plan</strong><small>The statement is not executed with analysis.</small></div>`;
+    const result = state.explainResult;
+    if (!result) return `<div class="query-empty"><span class="empty-glyph">⌁</span><strong>No plan captured</strong><p>Choose Explain to inspect the statement without running ANALYZE.</p></div>`;
+    const rows = [];
+    const visit = (node, depth = 0) => {
+      rows.push({ node, depth });
+      (node.children || []).forEach(child => visit(child, depth + 1));
+    };
+    (result.nodes || []).forEach(node => visit(node));
+    return `<div class="explain-instrument"><div class="grid-scroll"><table class="definition-table explain-table"><thead><tr><th>Operation</th><th>Relation</th><th>Estimated rows</th><th>Total cost</th><th>Warning</th><th>Detail</th></tr></thead><tbody>${rows.map(({ node, depth }) => `<tr><td><span class="plan-operation" style="--plan-depth:${depth}">${html(node.operation || "Plan")}</span></td><td>${html(node.relation || "—")}</td><td>${node.estimated_rows || "—"}</td><td>${node.total_cost || "—"}</td><td class="plan-warning">${html(node.warning || "—")}</td><td><code>${html(node.detail || "")}</code></td></tr>`).join("")}</tbody></table></div><footer class="result-status"><div><span class="status-light good"></span>${rows.length} plan ${rows.length === 1 ? "node" : "nodes"}</div><div>${html(capturedLabel(result.captured_at))}<i></i>ANALYZE disabled</div></footer></div>`;
   }
 
   function renderConnections() {
@@ -1639,7 +2081,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     const heading = !showForm
       ? "Choose a database"
       : configuring
-        ? state.connectionEngine === "postgres" ? "Connect to PostgreSQL" : "Open a SQLite database"
+        ? state.editingConnectionID
+          ? `Edit ${state.connections.find(connection => connection.id === state.editingConnectionID)?.name || "connection"}`
+          : state.connectionEngine === "postgres" ? "Connect to PostgreSQL" : "Open a SQLite database"
         : hasConnections ? "Add another database" : "Add your first database";
     const description = !showForm
       ? "Select a database to enter the workspace. You can return here whenever you need to switch."
@@ -1682,6 +2126,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         ${state.connections.map(connection => {
           const active = connection.id === state.connectionID;
           const connecting = connection.id === state.connectingID;
+          const connected = connection.status === "connected";
           return `<article class="connection-choice ${active ? "active" : ""}">
             <div class="connection-choice-identity">
               <span class="engine-tile ${html(connection.engine)}">${engineMonogram(connection.engine)}</span>
@@ -1695,12 +2140,17 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
               <code title="${html(connection.address)}">${html(connection.address)}</code>
             </div>
             <div class="connection-choice-access">
-              <span class="ready-signal"><i></i>${active ? "In use" : "Ready"}</span>
+              <span class="ready-signal ${connected ? "" : "offline"}"><i></i>${connected ? active ? "In use" : "Ready" : "Disconnected"}</span>
               <small>${connection.read_only ? "Read-only" : "Read/write"}</small>
             </div>
-            <button class="btn ${active ? "" : "primary"}" type="button" data-action="use-connection" data-connection="${html(connection.id)}" ${connecting ? "disabled" : ""}>
-              ${connecting ? "Connecting…" : active ? "Continue" : "Connect"}
-            </button>
+            <div class="connection-choice-actions">
+              <button class="btn ${active || !connected ? "" : "primary"}" type="button" data-action="${connected ? "use-connection" : "reconnect-connection"}" data-connection="${html(connection.id)}" ${connecting ? "disabled" : ""}>${connecting ? "Connecting…" : connected ? active ? "Continue" : "Connect" : "Reconnect"}</button>
+              <details class="connection-actions-menu"><summary class="icon-button subtle-button" aria-label="Manage ${html(connection.name)}">•••</summary><div>
+                <button type="button" data-action="edit-connection" data-connection="${html(connection.id)}">Edit profile</button>
+                ${connected ? `<button type="button" data-action="disconnect-connection" data-connection="${html(connection.id)}">Disconnect</button>` : ""}
+                <button type="button" class="danger-copy" data-action="remove-connection" data-connection="${html(connection.id)}">Remove</button>
+              </div></details>
+            </div>
           </article>`;
         }).join("")}
       </div>
@@ -1750,10 +2200,11 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       : state.meta?.features?.connection_persistence
         ? "Saved on this device."
         : "Available until Rowake closes.";
+    const editing = Boolean(state.editingConnectionID);
     return `<section class="connection-editor" aria-label="Connection details">
       <form id="connection-form" class="${postgres ? "postgres-form" : "sqlite-form"}">
         <div class="connection-setup-heading">
-          <button type="button" class="connection-back-link" data-action="back-to-connection-types"><span aria-hidden="true">←</span> Database types</button>
+          <button type="button" class="connection-back-link" data-action="${editing ? "cancel-connection-form" : "back-to-connection-types"}"><span aria-hidden="true">←</span> ${editing ? "Connections" : "Database types"}</button>
           <div class="connection-setup-identity">
             <span class="engine-tile ${postgres ? "postgres" : "sqlite"}" aria-hidden="true">${postgres ? "P" : "S"}</span>
             <span><strong>${postgres ? "PostgreSQL" : "SQLite"}</strong><small>${postgres ? "Server connection" : "Local database file"}</small></span>
@@ -1777,8 +2228,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         <footer class="connection-form-actions">
           <span>${persistenceCopy}</span>
           <div>
-            <button type="button" class="btn" data-action="back-to-connection-types">Back</button>
-            <button type="submit" class="btn primary">Add and connect</button>
+            <button type="button" class="btn" data-action="test-connection" ${state.testingConnection ? "disabled" : ""}>${state.testingConnection ? "Testing…" : "Test connection"}</button>
+            <button type="button" class="btn" data-action="${editing ? "cancel-connection-form" : "back-to-connection-types"}">Cancel</button>
+            <button type="submit" class="btn primary">${editing ? "Save changes" : "Add and connect"}</button>
           </div>
         </footer>
       </form>
@@ -1868,6 +2320,20 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         </select>
         <small id="ssl-mode-status" class="field-status">TLS mode is included in the connection URL when enabled.</small>
       </label>
+      <label class="connection-field password-env-field">
+        <span>Password environment variable <small>optional</small></span>
+        <input name="password_env" type="text" autocomplete="off" spellcheck="false" placeholder="ROWAKE_DATABASE_PASSWORD" value="${html(draft.password_env)}">
+        <small class="field-status">Only the variable name is saved. Its value is read when connecting.</small>
+      </label>
+      <label class="connection-field secret-service-field">
+        <span>OS secret service <small>optional</small></span>
+        <input name="secret_service" type="text" autocomplete="off" spellcheck="false" placeholder="Rowake" value="${html(draft.secret_service)}">
+      </label>
+      <label class="connection-field secret-account-field">
+        <span>OS secret account <small>optional</small></span>
+        <input name="secret_account" type="text" autocomplete="off" spellcheck="false" placeholder="database-user" value="${html(draft.secret_account)}">
+        <small class="field-status">Uses macOS Keychain or Linux Secret Service. Both fields are required together.</small>
+      </label>
       <div class="ssh-tunnel-heading">
         <span>SSH tunnel</span>
         <small>Jump Server</small>
@@ -1912,6 +2378,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       port: "5432",
       username: "",
       password: "",
+      password_env: "",
+      secret_service: "",
+      secret_account: "",
       database: "",
       ssl_mode: "disable",
     };
@@ -1929,6 +2398,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     state.postgresDiscoveryLoading = false;
     state.postgresDiscoveryError = "";
     state.postgresFormTab = "general";
+    state.editingConnectionID = "";
   }
 
   function decodePostgresURLPart(value) {
@@ -1970,9 +2440,8 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     const hostValue = String(draft.host || "127.0.0.1").trim();
     const host = hostValue.includes(":") && !hostValue.startsWith("[") ? `[${hostValue}]` : hostValue;
     const username = String(draft.username || "");
-    const password = String(draft.password || "");
     const credentials = username
-      ? `${encodeURIComponent(username)}${password ? `:${encodeURIComponent(password)}` : ""}@`
+      ? `${encodeURIComponent(username)}@`
       : "";
     const port = String(draft.port || "5432").trim();
     const database = String(draft.database || "").trim();
@@ -1986,6 +2455,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       return { ...draft, connection_url: postgresURLFromDraft(draft) };
     }
     const parsed = parsePostgresURL(draft.connection_url);
+    if (!parsed.password) parsed.password = draft.password;
     const normalized = { ...draft, ...parsed };
     return { ...normalized, connection_url: postgresURLFromDraft(normalized) };
   }
@@ -2106,6 +2576,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       port: value("port", state.connectionDraft.port || "5432").trim(),
       username: value("username", state.connectionDraft.username).trim(),
       password: value("password", state.connectionDraft.password),
+      password_env: value("password_env", state.connectionDraft.password_env).trim(),
+      secret_service: value("secret_service", state.connectionDraft.secret_service).trim(),
+      secret_account: value("secret_account", state.connectionDraft.secret_account).trim(),
       database: value("database", state.connectionDraft.database).trim(),
       ssl_mode: value("ssl_mode", state.connectionDraft.ssl_mode || "disable"),
     };
@@ -2119,6 +2592,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       port: Number(draft.port),
       username: draft.username,
       password: draft.password,
+      password_env: draft.password_env,
+      secret_service: draft.secret_service,
+      secret_account: draft.secret_account,
       database: draft.database,
       ssl_mode: draft.ssl_mode,
     };
@@ -2203,8 +2679,137 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     }
   }
 
+  function replaceConnection(connection) {
+    const index = state.connections.findIndex(candidate => candidate.id === connection.id);
+    if (index >= 0) state.connections[index] = connection;
+    else state.connections.push(connection);
+  }
+
+  async function editConnection(connectionID) {
+    try {
+      const response = await api(`/api/v1/connections/${encodeURIComponent(connectionID)}/profile`);
+      const profile = response.profile || {};
+      state.connectionDraft = {
+        ...freshConnectionDraft(),
+        name: profile.name || "",
+        data_source_name: profile.data_source_name || "",
+        host: profile.host || "127.0.0.1",
+        port: String(profile.port || 5432),
+        username: profile.username || "",
+        password_env: profile.password_env || "",
+        secret_service: profile.secret_service || "",
+        secret_account: profile.secret_account || "",
+        database: profile.database || "",
+        ssl_mode: profile.ssl_mode || "prefer",
+      };
+      state.connectionEngine = profile.engine === "postgres" ? "postgres" : "sqlite";
+      state.connectionDraft.connection_url = state.connectionEngine === "postgres" ? postgresURLFromDraft(state.connectionDraft) : "";
+      state.editingConnectionID = connectionID;
+      state.connectionFormOpen = true;
+      state.connectionAddStep = "configure";
+      state.postgresFormTab = "general";
+      renderConnections();
+      document.getElementById("connection-name")?.focus();
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  async function testConnectionForm() {
+    const form = document.getElementById("connection-form");
+    if (!form || state.testingConnection) return;
+    const errorNode = form.querySelector(".connection-form-error");
+    try {
+      let draft = connectionDraftFromForm(form);
+      if (state.connectionEngine === "postgres") draft = normalizedPostgresDraft(draft);
+      const request = state.connectionEngine === "postgres"
+        ? postgresRequest(draft)
+        : { name: draft.name, engine: "sqlite", data_source_name: draft.data_source_name };
+      state.testingConnection = true;
+      state.connectionDraft = draft;
+      renderConnections();
+      await api("/api/v1/connections/test", { method: "POST", body: JSON.stringify(request) });
+      toast("Connection test succeeded");
+    } catch (error) {
+      toast(error.message, "error");
+      if (errorNode) {
+        errorNode.textContent = error.message;
+        errorNode.hidden = false;
+      }
+    } finally {
+      state.testingConnection = false;
+      renderConnections();
+    }
+  }
+
+  async function disconnectConnection(connectionID) {
+    try {
+      const response = await api(`/api/v1/connections/${encodeURIComponent(connectionID)}/disconnect`, { method: "POST" });
+      replaceConnection(response.connection);
+      if (state.connectionID === connectionID) {
+        state.connectionID = "";
+        state.catalog = null;
+        state.snapshot = null;
+      }
+      toast(`Disconnected ${response.connection.name}`);
+      renderConnections();
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  async function reconnectConnection(connectionID) {
+    const connection = state.connections.find(candidate => candidate.id === connectionID);
+    let password = "";
+    if (connection?.engine === "postgres") {
+      try {
+        const response = await api(`/api/v1/connections/${encodeURIComponent(connectionID)}/profile`);
+        if (!response.profile?.password_env && !response.profile?.secret_service) {
+          password = window.prompt(`Password for ${connection.name} (leave blank if none)`) || "";
+        }
+      } catch (_) {
+        password = "";
+      }
+    }
+    state.connectingID = connectionID;
+    renderConnections();
+    try {
+      const response = await api(`/api/v1/connections/${encodeURIComponent(connectionID)}/reconnect`, {
+        method: "POST",
+        body: JSON.stringify({ password }),
+      });
+      replaceConnection(response.connection);
+      await changeConnection(connectionID, "connections");
+    } catch (error) {
+      state.connectingID = "";
+      toast(error.message, "error");
+      renderConnections();
+    }
+  }
+
+  async function removeConnection(connectionID) {
+    const connection = state.connections.find(candidate => candidate.id === connectionID);
+    if (!connection || !window.confirm(`Remove ${connection.name}? The database itself will not be changed.`)) return;
+    try {
+      await api(`/api/v1/connections/${encodeURIComponent(connectionID)}`, { method: "DELETE" });
+      state.connections = state.connections.filter(candidate => candidate.id !== connectionID);
+      state.catalogCache.delete(connectionID);
+      state.topologyCache.delete(connectionID);
+      if (state.connectionID === connectionID) {
+        state.connectionID = "";
+        state.catalog = null;
+        state.snapshot = null;
+      }
+      toast(`Removed ${connection.name}`);
+      renderConnections();
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
   async function runQuery() {
     if (queryEditorView) state.querySQL = queryEditorView.state.doc.toString();
+    syncActiveQuery(state.querySQL);
     if (!state.connectionID) {
       toast("Select a connection first", "error");
       return;
@@ -2216,6 +2821,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     state.queryRunning = true;
     state.queryResult = null;
     state.queryError = "";
+    state.queryResultMode = "results";
     renderQuery();
     try {
       state.queryResult = await api("/api/v1/query", {
@@ -2224,14 +2830,70 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
           connection_id: state.connectionID,
           sql: state.querySQL,
           limit: state.settings.rowLimit,
+          timeout_seconds: state.settings.statementTimeout,
         }),
       });
+      state.queryHistory = [{
+        id: `history-${Date.now()}`,
+        name: activeQueryTab().name,
+        sql: state.querySQL,
+        connection_scope: connectionScope(),
+        created_at: state.queryResult.captured_at || new Date().toISOString(),
+      }, ...state.queryHistory].slice(0, 100);
+      persistWorkspace();
     } catch (error) {
       state.queryError = error.message;
     } finally {
       state.queryRunning = false;
       renderQuery();
     }
+  }
+
+  async function explainQuery() {
+    if (queryEditorView) state.querySQL = queryEditorView.state.doc.toString();
+    syncActiveQuery(state.querySQL);
+    if (!state.connectionID || !state.querySQL.trim()) {
+      toast("Enter a query before requesting a plan", "error");
+      return;
+    }
+    state.explainRunning = true;
+    state.queryError = "";
+    state.queryResultMode = "plan";
+    renderQuery();
+    try {
+      state.explainResult = await api("/api/v1/explain", {
+        method: "POST",
+        body: JSON.stringify({ connection_id: state.connectionID, sql: state.querySQL, limit: state.settings.rowLimit, timeout_seconds: state.settings.statementTimeout }),
+      });
+    } catch (error) {
+      state.queryError = error.message;
+      state.explainResult = null;
+      toast(error.message, "error");
+    } finally {
+      state.explainRunning = false;
+      renderQuery();
+    }
+  }
+
+  function saveActiveQuery() {
+    if (queryEditorView) syncActiveQuery(queryEditorView.state.doc.toString());
+    const tab = activeQueryTab();
+    if (!tab.sql.trim()) {
+      toast("Enter a query before saving it", "error");
+      return;
+    }
+    const existing = state.savedQueries.find(item => item.id === `saved-${tab.id}`);
+    const saved = {
+      id: `saved-${tab.id}`,
+      name: tab.name || "Untitled query",
+      sql: tab.sql,
+      connection_scope: connectionScope(),
+      created_at: new Date().toISOString(),
+    };
+    if (existing) Object.assign(existing, saved);
+    else state.savedQueries.unshift(saved);
+    persistWorkspace();
+    toast(`Saved ${saved.name}`);
   }
 
   function selectedRowObject() {
@@ -2289,6 +2951,9 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       state.tableTab = "data";
       state.snapshot = null;
       state.inspectorOpen = false;
+      state.tableFilters = [];
+      state.tableSort = null;
+      state.tableCursor = "";
       renderBrowse();
       await loadTable(true);
     } else if (action === "select-table-tab") {
@@ -2309,19 +2974,27 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       renderBrowse();
     } else if (action === "remove-table-filter") {
       state.tableFilters = state.tableFilters.filter(filter => String(filter.id) !== target.dataset.filter);
-      renderBrowse();
+      state.tableCursor = "";
+      await loadTable(true, "");
     } else if (action === "clear-table-filters") {
       state.tableFilters = [];
-      renderBrowse();
+      state.tableCursor = "";
+      await loadTable(true, "");
     } else if (action === "clear-table-sort") {
       state.tableSort = null;
-      renderBrowse();
+      state.tableCursor = "";
+      await loadTable(true, "");
     } else if (action === "sort-column") {
       const column = target.dataset.column;
       if (state.tableSort?.column !== column) state.tableSort = { column, direction: "asc" };
       else if (state.tableSort.direction === "asc") state.tableSort = { column, direction: "desc" };
       else state.tableSort = null;
-      renderBrowse();
+      state.tableCursor = "";
+      await loadTable(true, "");
+    } else if (action === "previous-table-page") {
+      await loadTable(true, state.snapshot?.previous_cursor || "");
+    } else if (action === "next-table-page") {
+      await loadTable(true, state.snapshot?.next_cursor || "");
     } else if (action === "refresh-catalog") {
       state.catalogCache.delete(state.connectionID);
       state.topologyCache.delete(state.connectionID);
@@ -2334,6 +3007,26 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       state.topologyError = "";
       await loadTopology(true);
       if (!state.topologyError) toast("Topology refreshed");
+    } else if (action === "capture-schema") {
+      try {
+        await captureSchemaSnapshot();
+      } catch (error) {
+        toast(error.message, "error");
+      }
+    } else if (action === "compare-schema") {
+      try {
+        await compareSchemaSnapshot();
+      } catch (error) {
+        toast(error.message, "error");
+      }
+    } else if (action === "close-schema-diff") {
+      state.schemaDiff = null;
+      renderTopology();
+    } else if (action === "copy-schema-diff") {
+      const content = target.dataset.format === "json"
+        ? JSON.stringify(state.schemaDiff, null, 2)
+        : schemaDiffMarkdown(state.schemaDiff);
+      await copyText(content, `Schema diff copied as ${target.dataset.format === "json" ? "JSON" : "Markdown"}`);
     } else if (action === "toggle-topology-table") {
       const next = new Set(state.topologyExpanded);
       if (next.has(target.dataset.id)) next.delete(target.dataset.id);
@@ -2360,6 +3053,18 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       await loadTable(true);
     } else if (action === "copy-table-name") {
       await copyText(`${state.selected.schema}.${state.selected.table}`, "Table name copied");
+    } else if (action === "toggle-object-pin") {
+      toggleSelectedObjectPin();
+    } else if (action === "query-table") {
+      newQueryTab(`SELECT *\nFROM ${quoteIdentifier(state.selected.schema)}.${quoteIdentifier(state.selected.table)}\nLIMIT ${state.settings.rowLimit};`, `${state.selected.table}.sql`);
+      navigate("query");
+    } else if (action === "open-related") {
+      await openRelatedRelationship(target.dataset.relationship, target.dataset.direction);
+    } else if (action === "open-related-cell") {
+      state.selectedRow = Number(target.dataset.row || 0);
+      await openRelatedRelationship(target.dataset.relationship, "outgoing");
+    } else if (action === "back-related") {
+      await backRelatedNavigation();
     } else if (action === "copy-row") {
       await copyText(JSON.stringify(selectedRowObject(), null, 2), "Row copied as JSON");
     } else if (action === "copy-where") {
@@ -2371,6 +3076,44 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         return `${quoteIdentifier(key)} = ${typeof value === "number" ? value : `'${String(value).replaceAll("'", "''")}'`}`;
       });
       await copyText(parts.length ? `WHERE ${parts.join(" AND ")}` : "-- No primary key reported", "WHERE clause copied");
+    } else if (action === "new-query-tab") {
+      newQueryTab();
+      renderQuery();
+    } else if (action === "select-query-tab") {
+      activateQueryTab(target.dataset.queryTab);
+    } else if (action === "close-query-tab") {
+      closeQueryTab(target.dataset.queryTab);
+    } else if (action === "save-query") {
+      saveActiveQuery();
+    } else if (action === "toggle-query-history") {
+      state.workspacePanel = state.workspacePanel === "history" ? "" : "history";
+      renderQuery();
+    } else if (action === "toggle-saved-queries") {
+      state.workspacePanel = state.workspacePanel === "saved" ? "" : "saved";
+      renderQuery();
+    } else if (action === "close-query-library") {
+      state.workspacePanel = "";
+      renderQuery();
+    } else if (action === "open-saved-query" || action === "open-history-query") {
+      const source = action === "open-saved-query" ? state.savedQueries : state.queryHistory;
+      const item = source.find(candidate => candidate.id === target.dataset.queryId);
+      if (item) {
+        newQueryTab(item.sql, item.name);
+        state.workspacePanel = "";
+        renderQuery();
+      }
+    } else if (action === "remove-saved-query") {
+      state.savedQueries = state.savedQueries.filter(item => item.id !== target.dataset.queryId);
+      persistWorkspace();
+      renderQuery();
+    } else if (action === "show-query-results") {
+      state.queryResultMode = "results";
+      renderQuery();
+    } else if (action === "show-query-plan") {
+      state.queryResultMode = "plan";
+      renderQuery();
+    } else if (action === "explain-query") {
+      await explainQuery();
     } else if (action === "run-query") {
       await runQuery();
     } else if (action === "format-query") {
@@ -2393,6 +3136,16 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       await copyText(JSON.stringify(objects, null, 2), "Query results copied");
     } else if (action === "use-connection") {
       await changeConnection(target.dataset.connection, "connections");
+    } else if (action === "edit-connection") {
+      await editConnection(target.dataset.connection);
+    } else if (action === "test-connection") {
+      await testConnectionForm();
+    } else if (action === "disconnect-connection") {
+      await disconnectConnection(target.dataset.connection);
+    } else if (action === "reconnect-connection") {
+      await reconnectConnection(target.dataset.connection);
+    } else if (action === "remove-connection") {
+      await removeConnection(target.dataset.connection);
     } else if (action === "show-connection-form") {
       state.connectionFormOpen = true;
       resetConnectionAddFlow();
@@ -2446,7 +3199,8 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         operator,
         value: ["is-null", "is-not-null"].includes(operator) ? "" : String(fields.get("value") || ""),
       }];
-      renderBrowse();
+      state.tableCursor = "";
+      await loadTable(true, "");
       return;
     }
     if (event.target.id === "table-sort-form") {
@@ -2456,7 +3210,8 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         column: String(fields.get("column") || ""),
         direction: String(fields.get("direction") || "asc") === "desc" ? "desc" : "asc",
       };
-      renderBrowse();
+      state.tableCursor = "";
+      await loadTable(true, "");
       return;
     }
     if (event.target.id === "connection-entry-form") {
@@ -2512,12 +3267,13 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
             engine: "sqlite",
             data_source_name: draft.data_source_name,
           };
-      const response = await api("/api/v1/connections", {
-        method: "POST",
+      const editingID = state.editingConnectionID;
+      const response = await api(editingID ? `/api/v1/connections/${encodeURIComponent(editingID)}` : "/api/v1/connections", {
+        method: editingID ? "PUT" : "POST",
         body: JSON.stringify(request),
       });
       const connection = response.connection;
-      state.connections.push(connection);
+      replaceConnection(connection);
       state.connectionID = connection.id;
       state.connectionFormOpen = false;
       state.connectionAddStep = "choose";
@@ -2525,10 +3281,11 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
       state.queryResult = null;
       state.queryError = "";
       state.connectionDraft.password = "";
+      state.editingConnectionID = "";
       state.postgresDatabases = [];
       await loadCatalog(connection.id, true);
       const persisted = connection.engine === "sqlite" && state.meta?.features?.connection_persistence;
-      toast(`${persisted ? "Saved" : "Opened"} ${connection.name}`);
+      toast(`${editingID ? "Updated" : persisted ? "Saved" : "Opened"} ${connection.name}`);
       navigate("browse");
     } catch (error) {
       errorNode.textContent = state.connectionEngine === "postgres"
@@ -2536,13 +3293,39 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
         : `${error.message}. Check the file path and try again.`;
       errorNode.hidden = false;
       submit.disabled = false;
-      submit.textContent = "Add and connect";
+      submit.textContent = state.editingConnectionID ? "Save changes" : "Add and connect";
     }
   });
 
   document.addEventListener("change", async event => {
-    if (event.target.id === "connection-picker") {
+    if (event.target.matches('[data-setting="row-limit"]')) {
+      const limit = Number(event.target.value);
+      if ([50, 100, 250, 500, 1000].includes(limit)) {
+        state.settings.rowLimit = limit;
+        persistWorkspace();
+      }
+    } else if (event.target.matches('[data-setting="statement-timeout"]')) {
+      const timeout = Number(event.target.value);
+      if ([5, 10, 15].includes(timeout)) {
+        state.settings.statementTimeout = timeout;
+        persistWorkspace();
+      }
+    } else if (event.target.id === "connection-picker") {
       await changeConnection(event.target.value);
+    } else if (event.target.id === "mobile-object-picker") {
+      const [schemaIndex, tableIndex] = String(event.target.value || "").split(":").map(Number);
+      const table = state.catalog?.schemas?.[schemaIndex]?.tables?.[tableIndex];
+      if (table) {
+        state.selected = { schema: table.schema, table: table.name };
+        state.tableTab = "data";
+        state.snapshot = null;
+        state.inspectorOpen = false;
+        state.tableFilters = [];
+        state.tableSort = null;
+        state.tableCursor = "";
+        renderBrowse();
+        await loadTable(true);
+      }
     } else if (event.target.id === "connection-string-entry") {
       applyConnectionEntryURL(event.target.value, true);
     } else if (event.target.id === "postgres-url") {
@@ -2550,14 +3333,19 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     } else if (
       event.target.form?.id === "connection-form" &&
       state.connectionEngine === "postgres" &&
-      ["host", "port", "username", "password", "database", "ssl_mode"].includes(event.target.name)
+      ["host", "port", "username", "password", "password_env", "secret_service", "secret_account", "database", "ssl_mode"].includes(event.target.name)
     ) {
       syncPostgresURLFromForm();
     }
   });
 
   document.addEventListener("input", event => {
-    if (event.target.matches("[data-connection-menu-search]")) {
+    if (event.target.matches("[data-query-name]")) {
+      activeQueryTab().name = String(event.target.value || "Untitled query").slice(0, 80);
+      persistWorkspace();
+      const tabLabel = document.querySelector(`[data-query-tab="${CSS.escape(state.activeQueryTabID)}"] span`)?.nextSibling;
+      if (tabLabel) tabLabel.textContent = activeQueryTab().name;
+    } else if (event.target.matches("[data-connection-menu-search]")) {
       filterConnectionMenuOptions(event.target.closest(".connection-picker"), event.target.value);
     } else if (event.target.id === "catalog-search") {
       state.catalogSearch = event.target.value;
@@ -2593,7 +3381,7 @@ import { formatDatabaseValue, rawDatabaseValue } from "./value-formatters.mjs";
     } else if (
       event.target.form?.id === "connection-form" &&
       state.connectionEngine === "postgres" &&
-      ["host", "port", "username", "password", "database"].includes(event.target.name)
+      ["host", "port", "username", "password", "password_env", "secret_service", "secret_account", "database"].includes(event.target.name)
     ) {
       syncPostgresURLFromForm(false);
     }

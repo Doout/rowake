@@ -20,17 +20,26 @@ Run as a server:
 
 ```sh
 make build
-./bin/rowake serve --listen 0.0.0.0:8080
+./bin/rowake serve --listen 0.0.0.0:8080 --access-token 'replace-with-a-long-random-token'
 ```
 
-Open **Connections** to choose a saved database. Adding one starts with a connection-string/type chooser, then opens a dedicated SQLite or PostgreSQL setup screen. PostgreSQL connections can load the databases available to the supplied account before you select one. Browse tables across schemas, filter or sort the loaded row preview, inspect relationship topology, or run a read-only query.
+Non-loopback server mode requires an access token. Open the server once with
 
-The Wails desktop app saves and restores SQLite file connections. PostgreSQL credentials are never persisted by Rowake; PostgreSQL connections and all browser/server connections stay in memory until Rowake closes. Use a database account restricted to the intended databases and schemas.
+```text
+http://server:8080/?token=replace-with-a-long-random-token
+```
+
+to establish an HTTP-only browser session; Rowake immediately removes the token from the URL. The `ROWAKE_ACCESS_TOKEN` environment variable is equivalent to `--access-token`.
+
+Open **Connections** to add, test, edit, disconnect, reconnect, or remove a profile. PostgreSQL can load the databases available to the supplied account. Browse tables with bounded server-side filters, sorting, and pagination; follow parent/child records; inspect schema topology; save investigation tabs; run read-only SQL; or request a non-analyzing explain plan.
+
+The Wails desktop app saves SQLite definitions and non-secret PostgreSQL profile fields. PostgreSQL passwords are never persisted by Rowake. A profile can instead name an environment variable or an OS secret item (macOS Keychain or Linux Secret Service). Use a database account restricted to the intended databases and schemas.
 
 For Compose, place SQLite files in `./data`; they are available to Rowake under `/data`:
 
 ```sh
 mkdir -p data
+export ROWAKE_ACCESS_TOKEN='replace-with-a-long-random-token'
 docker compose up --build
 ```
 
@@ -59,6 +68,7 @@ make vuln
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Security](docs/SECURITY.md)
 - [Database drivers](docs/DRIVERS.md)
 - [Releases](docs/RELEASING.md)
 - [Product scope](PRODUCT.md)

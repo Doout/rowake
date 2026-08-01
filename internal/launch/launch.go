@@ -21,6 +21,7 @@ type Config struct {
 	Version         string
 	Logger          *slog.Logger
 	ConnectionStore string
+	AccessToken     string
 }
 
 type RunningServer struct {
@@ -52,7 +53,7 @@ func Start(parent context.Context, config Config) (*RunningServer, error) {
 			config.Logger.Warn("some saved connections could not be restored", "error", err)
 		}
 	}
-	handler, err := server.New(appService, config.Logger)
+	handler, err := server.NewWithAccessToken(appService, config.Logger, config.AccessToken)
 	if err != nil {
 		_ = appService.Close()
 		return nil, err
